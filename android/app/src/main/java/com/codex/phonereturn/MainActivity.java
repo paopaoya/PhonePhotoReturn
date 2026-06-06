@@ -5,19 +5,27 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.graphics.ImageFormat;
-import android.hardware.Camera;
 import android.net.Uri;
 import android.os.Bundle;
 import android.view.Gravity;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
-import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageCapture;
+import androidx.camera.core.ImageCaptureException;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.core.Preview;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
+import androidx.core.content.ContextCompat;
+import androidx.lifecycle.Lifecycle;
+import androidx.lifecycle.LifecycleOwner;
+import androidx.lifecycle.LifecycleRegistry;
 
 import com.google.zxing.BinaryBitmap;
 import com.google.zxing.DecodeHintType;
@@ -29,23 +37,22 @@ import com.google.zxing.common.HybridBinarizer;
 
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import com.google.common.util.concurrent.ListenableFuture;
 
-@SuppressWarnings("deprecation")
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements LifecycleOwner {
     private static final int REQUEST_CAMERA = 1001;
     private static final String PREFS = "phone_photo_return";
     private static final String KEY_BASE_URL = "base_url";
@@ -54,12 +61,16 @@ public class MainActivity extends Activity {
     private static final String KEY_PORT = "port";
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private Camera camera;
-    private SurfaceView surfaceView;
+    private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
+    private LifecycleRegistry lifecycleRegistry;
+    private ProcessCameraProvider cameraProvider;
+    private PreviewView previewView;
+    private ImageCapture imageCapture;
     private TextView statusText;
     private String pendingCameraAction;
     private boolean scanning;
     private long lastDecodeAttempt;
+    private int cameraSessionId;
 
     private String baseUrl;
     private String token;
@@ -69,9 +80,35 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        lifecycleRegistry = new LifecycleRegistry(this);
+        lifecycleRegistry.setCurrentState(Lifecycle.State.CREATED);
         loadPairing();
         handleIntent(getIntent());
         showHome();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        lifecycleRegistry.setCurrentState(Lifecycle.State.STARTED);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        lifecycleRegistry.setCurrentState(Lifecycle.State.RESUMED);
+    }
+
+    @Override
+    protected void onPause() {
+        lifecycleRegistry.setCurrentState(Lifecycle.State.STARTED);
+        super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        lifecycleRegistry.setCurrentState(Lifecycle.State.CREATED);
+        super.onStop();
     }
 
     @Override
@@ -85,7 +122,14 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         stopCamera();
         worker.shutdown();
+        cameraExecutor.shutdown();
+        lifecycleRegistry.setCurrentState(Lifecycle.State.DESTROYED);
         super.onDestroy();
+    }
+
+    @Override
+    public Lifecycle getLifecycle() {
+        return lifecycleRegistry;
     }
 
     @Override
@@ -218,8 +262,9 @@ public class MainActivity extends Activity {
         TextView title = text("扫描电脑端 App 配对二维码", 18, true);
         root.addView(title, fullWrap());
 
-        surfaceView = new SurfaceView(this);
-        root.addView(surfaceView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+        previewView = new PreviewView(this);
+        previewView.setScaleType(PreviewView.ScaleType.FILL_CENTER);
+        root.addView(previewView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
 
         statusText = text("将二维码放入画面中央", 14, false);
         statusText.setTextColor(0xFF2563EB);
@@ -246,8 +291,9 @@ public class MainActivity extends Activity {
         TextView title = text("拍照后自动上传", 18, true);
         root.addView(title, fullWrap());
 
-        surfaceView = new SurfaceView(this);
-        root.addView(surfaceView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+        previewView = new PreviewView(this);
+        previewView.setScaleType(PreviewView.ScaleType.FILL_CENTER);
+        root.addView(previewView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
 
         Button capture = button("拍照并上传");
         capture.setOnClickListener(v -> takePhoto());
@@ -266,49 +312,64 @@ public class MainActivity extends Activity {
     }
 
     private void startCamera(boolean scanMode) {
-        SurfaceHolder holder = surfaceView.getHolder();
-        holder.addCallback(new SurfaceHolder.Callback() {
-            @Override
-            public void surfaceCreated(SurfaceHolder holder) {
-                try {
-                    camera = Camera.open();
-                    camera.setDisplayOrientation(90);
-                    Camera.Parameters params = camera.getParameters();
-                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
-                    camera.setParameters(params);
-                    camera.setPreviewDisplay(holder);
-                    if (scanMode) {
-                        camera.setPreviewCallback((data, cam) -> decodePreviewFrame(data, cam));
-                    }
-                    camera.startPreview();
-                } catch (Exception e) {
-                    setStatus("启动相机失败: " + e.getMessage());
+        int sessionId = ++cameraSessionId;
+        ListenableFuture<ProcessCameraProvider> providerFuture = ProcessCameraProvider.getInstance(this);
+        providerFuture.addListener(() -> {
+            try {
+                ProcessCameraProvider provider = providerFuture.get();
+                if (sessionId != cameraSessionId || previewView == null) {
+                    return;
                 }
-            }
+                cameraProvider = provider;
+                provider.unbindAll();
 
-            @Override
-            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-            }
+                Preview preview = new Preview.Builder().build();
+                preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
-            @Override
-            public void surfaceDestroyed(SurfaceHolder holder) {
-                stopCamera();
+                CameraSelector cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA;
+                if (scanMode) {
+                    ImageAnalysis analysis = new ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build();
+                    analysis.setAnalyzer(cameraExecutor, this::decodePreviewFrame);
+                    provider.bindToLifecycle(this, cameraSelector, preview, analysis);
+                    imageCapture = null;
+                } else {
+                    imageCapture = new ImageCapture.Builder()
+                            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                            .build();
+                    provider.bindToLifecycle(this, cameraSelector, preview, imageCapture);
+                }
+            } catch (Exception e) {
+                setStatus("启动相机失败: " + e.getMessage());
             }
-        });
+        }, ContextCompat.getMainExecutor(this));
     }
 
-    private void decodePreviewFrame(byte[] data, Camera cam) {
-        long now = System.currentTimeMillis();
-        if (!scanning || now - lastDecodeAttempt < 450) {
-            return;
-        }
-        lastDecodeAttempt = now;
+    private void decodePreviewFrame(ImageProxy image) {
+        try {
+            long now = System.currentTimeMillis();
+            if (!scanning || now - lastDecodeAttempt < 450) {
+                return;
+            }
+            lastDecodeAttempt = now;
 
-        Camera.Size size = cam.getParameters().getPreviewSize();
-        worker.execute(() -> {
+            byte[] luminance = imageToLuminance(image);
+            int width = image.getWidth();
+            int height = image.getHeight();
+            int rotationDegrees = image.getImageInfo().getRotationDegrees();
+            if (rotationDegrees == 90 || rotationDegrees == 270) {
+                luminance = rotateYPlane(luminance, width, height, rotationDegrees);
+                int rotatedWidth = height;
+                height = width;
+                width = rotatedWidth;
+            } else if (rotationDegrees == 180) {
+                luminance = rotateYPlane(luminance, width, height, rotationDegrees);
+            }
+
             try {
                 PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(
-                        data, size.width, size.height, 0, 0, size.width, size.height, false);
+                        luminance, width, height, 0, 0, width, height, false);
                 BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
                 MultiFormatReader reader = new MultiFormatReader();
                 Map<DecodeHintType, Object> hints = new HashMap<>();
@@ -329,30 +390,79 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 runOnUiThread(() -> setStatus("扫码失败: " + e.getMessage()));
             }
-        });
+        } finally {
+            image.close();
+        }
+    }
+
+    private byte[] imageToLuminance(ImageProxy image) {
+        ImageProxy.PlaneProxy plane = image.getPlanes()[0];
+        ByteBuffer buffer = plane.getBuffer();
+        int width = image.getWidth();
+        int height = image.getHeight();
+        int rowStride = plane.getRowStride();
+        int pixelStride = plane.getPixelStride();
+        byte[] luminance = new byte[width * height];
+        int outputOffset = 0;
+
+        for (int y = 0; y < height; y++) {
+            int rowStart = y * rowStride;
+            for (int x = 0; x < width; x++) {
+                luminance[outputOffset++] = buffer.get(rowStart + x * pixelStride);
+            }
+        }
+        return luminance;
+    }
+
+    private byte[] rotateYPlane(byte[] data, int width, int height, int rotationDegrees) {
+        byte[] rotated = new byte[data.length];
+        if (rotationDegrees == 90) {
+            int index = 0;
+            for (int x = 0; x < width; x++) {
+                for (int y = height - 1; y >= 0; y--) {
+                    rotated[index++] = data[y * width + x];
+                }
+            }
+        } else if (rotationDegrees == 180) {
+            for (int i = 0; i < data.length; i++) {
+                rotated[i] = data[data.length - 1 - i];
+            }
+        } else if (rotationDegrees == 270) {
+            int index = 0;
+            for (int x = width - 1; x >= 0; x--) {
+                for (int y = 0; y < height; y++) {
+                    rotated[index++] = data[y * width + x];
+                }
+            }
+        } else {
+            return data;
+        }
+        return rotated;
     }
 
     private void takePhoto() {
-        if (camera == null) {
+        if (imageCapture == null) {
             setStatus("相机还没有准备好");
             return;
         }
         setStatus("正在拍照...");
-        camera.takePicture(null, null, (data, cam) -> {
-            File file = new File(getCacheDir(), "photo_" + System.currentTimeMillis() + ".jpg");
-            try {
-                java.io.FileOutputStream out = new java.io.FileOutputStream(file);
-                out.write(data);
-                out.close();
-                uploadPhoto(file);
-            } catch (IOException e) {
-                setStatus("保存临时照片失败: " + e.getMessage());
-            }
-            try {
-                cam.startPreview();
-            } catch (Exception ignored) {
-            }
-        });
+        File file = new File(getCacheDir(), "photo_" + System.currentTimeMillis() + ".jpg");
+        ImageCapture.OutputFileOptions options = new ImageCapture.OutputFileOptions.Builder(file).build();
+        imageCapture.takePicture(
+                options,
+                ContextCompat.getMainExecutor(this),
+                new ImageCapture.OnImageSavedCallback() {
+                    @Override
+                    public void onImageSaved(ImageCapture.OutputFileResults outputFileResults) {
+                        uploadPhoto(file);
+                    }
+
+                    @Override
+                    public void onError(ImageCaptureException exception) {
+                        setStatus("拍照失败: " + exception.getMessage());
+                    }
+                }
+        );
     }
 
     private void uploadPhoto(File file) {
@@ -497,14 +607,11 @@ public class MainActivity extends Activity {
 
     private void stopCamera() {
         scanning = false;
-        if (camera != null) {
-            try {
-                camera.setPreviewCallback(null);
-                camera.stopPreview();
-                camera.release();
-            } catch (Exception ignored) {
-            }
-            camera = null;
+        cameraSessionId++;
+        imageCapture = null;
+        previewView = null;
+        if (cameraProvider != null) {
+            cameraProvider.unbindAll();
         }
     }
 

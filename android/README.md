@@ -10,7 +10,7 @@ Android client for the PhonePhotoReturn desktop receiver.
 4. Tap camera, then tap capture.
 5. The app uploads the photo directly to the PC receiver.
 
-The app uses CameraX for in-app capture, ML Kit for QR scanning, and OkHttp for upload.
+The app uses CameraX for camera preview/capture, ZXing for QR scanning, and HttpURLConnection for upload.
 
 ## Build
 
