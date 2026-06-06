@@ -1,19 +1,21 @@
+import ctypes
 import io
-import json
+import ipaddress
 import queue
 import secrets
 import socket
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 from tkinter import END, DISABLED, NORMAL, StringVar, Text, Tk, filedialog, ttk
-from urllib.parse import urlencode
 
 import qrcode
 from flask import Flask, abort, jsonify, render_template, request
+from werkzeug.serving import make_server
 from werkzeug.utils import secure_filename
 
 
@@ -25,6 +27,16 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
 
 upload_dir = DEFAULT_UPLOAD_DIR
 events = queue.Queue()
+server_ready = threading.Event()
+
+ERROR_BUFFER_OVERFLOW = 111
+ERROR_SUCCESS = 0
+GAA_FLAG_SKIP_ANYCAST = 0x0002
+GAA_FLAG_SKIP_MULTICAST = 0x0004
+GAA_FLAG_SKIP_DNS_SERVER = 0x0008
+IF_OPER_STATUS_UP = 1
+IF_TYPE_SOFTWARE_LOOPBACK = 24
+MAX_ADAPTER_ADDRESS_LENGTH = 8
 
 
 def resource_path(relative_path):
@@ -39,15 +51,176 @@ def ensure_upload_dir():
     upload_dir.mkdir(parents=True, exist_ok=True)
 
 
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def is_usable_ipv4(address):
     try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return ip.version == 4 and not ip.is_loopback and not ip.is_unspecified
+
+
+def append_ipv4_address(addresses, address):
+    if is_usable_ipv4(address) and address not in addresses:
+        addresses.append(address)
+
+
+def prioritize_ipv4_addresses(addresses):
+    private_addresses = []
+    other_addresses = []
+    link_local_addresses = []
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if ip.is_link_local:
+            link_local_addresses.append(address)
+        elif ip.is_private:
+            private_addresses.append(address)
+        else:
+            other_addresses.append(address)
+
+    return private_addresses or other_addresses or link_local_addresses or addresses
+
+
+def get_hostname_ipv4_addresses():
+    addresses = []
+    hostnames = {socket.gethostname(), socket.getfqdn()}
+    for hostname in hostnames:
+        if not hostname:
+            continue
+        try:
+            for item in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                append_ipv4_address(addresses, item[4][0])
+        except OSError:
+            pass
+
+        try:
+            for address in socket.gethostbyname_ex(hostname)[2]:
+                append_ipv4_address(addresses, address)
+        except OSError:
+            pass
+
+    return addresses
+
+
+def get_windows_adapter_ipv4_addresses():
+    if not sys.platform.startswith("win"):
+        return []
+
+    class SocketAddress(ctypes.Structure):
+        _fields_ = [
+            ("lpSockaddr", ctypes.c_void_p),
+            ("iSockaddrLength", ctypes.c_int),
+        ]
+
+    class SockaddrIn(ctypes.Structure):
+        _fields_ = [
+            ("sin_family", ctypes.c_ushort),
+            ("sin_port", ctypes.c_ushort),
+            ("sin_addr", ctypes.c_ubyte * 4),
+            ("sin_zero", ctypes.c_ubyte * 8),
+        ]
+
+    class IpAdapterUnicastAddress(ctypes.Structure):
+        pass
+
+    IpAdapterUnicastAddress._fields_ = [
+        ("Length", ctypes.c_ulong),
+        ("Flags", ctypes.c_ulong),
+        ("Next", ctypes.POINTER(IpAdapterUnicastAddress)),
+        ("Address", SocketAddress),
+    ]
+
+    class IpAdapterAddresses(ctypes.Structure):
+        pass
+
+    IpAdapterAddresses._fields_ = [
+        ("Length", ctypes.c_ulong),
+        ("IfIndex", ctypes.c_ulong),
+        ("Next", ctypes.POINTER(IpAdapterAddresses)),
+        ("AdapterName", ctypes.c_char_p),
+        ("FirstUnicastAddress", ctypes.POINTER(IpAdapterUnicastAddress)),
+        ("FirstAnycastAddress", ctypes.c_void_p),
+        ("FirstMulticastAddress", ctypes.c_void_p),
+        ("FirstDnsServerAddress", ctypes.c_void_p),
+        ("DnsSuffix", ctypes.c_wchar_p),
+        ("Description", ctypes.c_wchar_p),
+        ("FriendlyName", ctypes.c_wchar_p),
+        ("PhysicalAddress", ctypes.c_ubyte * MAX_ADAPTER_ADDRESS_LENGTH),
+        ("PhysicalAddressLength", ctypes.c_ulong),
+        ("Flags", ctypes.c_ulong),
+        ("Mtu", ctypes.c_ulong),
+        ("IfType", ctypes.c_ulong),
+        ("OperStatus", ctypes.c_int),
+        ("Ipv6IfIndex", ctypes.c_ulong),
+        ("ZoneIndices", ctypes.c_ulong * 16),
+        ("FirstPrefix", ctypes.c_void_p),
+    ]
+
+    get_adapters_addresses = ctypes.windll.iphlpapi.GetAdaptersAddresses
+    get_adapters_addresses.argtypes = [
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.POINTER(IpAdapterAddresses),
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    get_adapters_addresses.restype = ctypes.c_ulong
+
+    flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER
+    buffer_size = ctypes.c_ulong(15 * 1024)
+    buffer = ctypes.create_string_buffer(buffer_size.value)
+    adapter_addresses = ctypes.cast(buffer, ctypes.POINTER(IpAdapterAddresses))
+    result = get_adapters_addresses(socket.AF_INET, flags, None, adapter_addresses, ctypes.byref(buffer_size))
+    if result == ERROR_BUFFER_OVERFLOW:
+        buffer = ctypes.create_string_buffer(buffer_size.value)
+        adapter_addresses = ctypes.cast(buffer, ctypes.POINTER(IpAdapterAddresses))
+        result = get_adapters_addresses(socket.AF_INET, flags, None, adapter_addresses, ctypes.byref(buffer_size))
+    if result != ERROR_SUCCESS:
+        return []
+
+    addresses = []
+    adapter = adapter_addresses
+    while adapter:
+        adapter_item = adapter.contents
+        if adapter_item.IfType != IF_TYPE_SOFTWARE_LOOPBACK and adapter_item.OperStatus == IF_OPER_STATUS_UP:
+            unicast = adapter_item.FirstUnicastAddress
+            while unicast:
+                socket_address = unicast.contents.Address
+                if socket_address.lpSockaddr and socket_address.iSockaddrLength >= ctypes.sizeof(SockaddrIn):
+                    sockaddr = ctypes.cast(socket_address.lpSockaddr, ctypes.POINTER(SockaddrIn)).contents
+                    if sockaddr.sin_family == socket.AF_INET:
+                        append_ipv4_address(addresses, socket.inet_ntoa(bytes(sockaddr.sin_addr)))
+                unicast = unicast.contents.Next
+        adapter = adapter_item.Next
+
+    return addresses
+
+
+def get_local_ipv4_addresses():
+    addresses = []
+    for address in get_windows_adapter_ipv4_addresses():
+        append_ipv4_address(addresses, address)
+    for address in get_hostname_ipv4_addresses():
+        append_ipv4_address(addresses, address)
+
+    return prioritize_ipv4_addresses(addresses)
+
+
+def get_local_ip():
+    addresses = get_local_ipv4_addresses()
+    return addresses[0] if addresses else "127.0.0.1"
+
+
+def check_port_available(host, port):
+    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        test_socket.bind((host, port))
+    except OSError as exc:
+        return False, exc
     finally:
-        s.close()
+        test_socket.close()
+    return True, None
 
 
 def base_url():
@@ -73,38 +246,31 @@ def app_pair_payload():
     }
 
 
-def app_pair_url():
-    payload = app_pair_payload()
-    query = urlencode(
-        {
-            "host": payload["host"],
-            "port": payload["port"],
-            "token": payload["token"],
-            "base_url": payload["base_url"],
-        }
-    )
-    return f"photoreturn://pair?{query}"
-
-
 def allowed_file(filename):
     suffix = Path(filename).suffix.lower()
     return suffix in ALLOWED_EXTENSIONS or not suffix
 
 
-def unique_photo_path(original_name):
-    ensure_upload_dir()
+def photo_suffix(original_name):
     original_name = secure_filename(original_name or "")
     suffix = Path(original_name).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         suffix = ".jpg"
+    return suffix
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    candidate = upload_dir / f"{timestamp}{suffix}"
-    if not candidate.exists():
-        return candidate
 
-    high_res = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-    return upload_dir / f"{high_res}{suffix}"
+def reserve_photo_file(original_name):
+    ensure_upload_dir()
+    suffix = photo_suffix(original_name)
+    for _ in range(100):
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        random_part = uuid.uuid4().hex[:8]
+        photo_path = upload_dir / f"{timestamp}_{random_part}{suffix}"
+        try:
+            return photo_path, photo_path.open("xb")
+        except FileExistsError:
+            continue
+    raise RuntimeError("无法创建唯一照片文件名")
 
 
 def request_token():
@@ -159,8 +325,14 @@ def upload_file():
     if not allowed_file(file.filename):
         return jsonify({"error": "Unsupported file type"}), 400
 
-    photo_path = unique_photo_path(file.filename)
-    file.save(photo_path)
+    try:
+        photo_path, output = reserve_photo_file(file.filename)
+        with output:
+            file.save(output)
+    except Exception as exc:
+        if "photo_path" in locals() and photo_path.exists():
+            photo_path.unlink(missing_ok=True)
+        return jsonify({"error": f"Save failed: {exc}"}), 500
 
     msg = f"已保存照片: {photo_path}"
     print(msg, flush=True)
@@ -169,73 +341,73 @@ def upload_file():
 
 
 def run_server():
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    available, error = check_port_available("0.0.0.0", PORT)
+    if not available:
+        events.put(("error", f"服务启动失败，端口 {PORT} 不可用: {error}"))
+        return
+
+    try:
+        server = make_server("0.0.0.0", PORT, app)
+    except OSError as exc:
+        events.put(("error", f"服务启动失败，端口 {PORT} 不可用: {exc}"))
+        return
+
+    server_ready.set()
+    events.put(("ready", "服务已启动，等待手机上传"))
+    server.serve_forever()
 
 
 class PhotoReturnApp:
     def __init__(self):
         self.root = Tk()
+        self.root.withdraw()
         self.root.title(APP_NAME)
-        self.root.geometry("720x720")
-        self.root.minsize(660, 620)
+        self.root.iconbitmap(default=str(resource_path("assets/icon.ico")))
+        self.root.geometry("620x560")
+        self.root.minsize(560, 520)
 
-        self.web_url_var = StringVar(value=web_url())
-        self.app_pair_var = StringVar(value=app_pair_url())
+        self.scan_url_var = StringVar(value="")
         self.path_var = StringVar(value=str(upload_dir))
-        self.status_var = StringVar(value="服务已启动，等待手机上传")
+        self.status_var = StringVar(value="正在启动服务...")
 
         self.build_ui()
-        self.refresh_qr_codes()
+        self.center_window()
         self.root.after(300, self.poll_events)
 
     def build_ui(self):
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
 
-        pad = {"padx": 16, "pady": 8}
+        pad = {"padx": 10, "pady": 5}
         title = ttk.Label(self.root, text=APP_NAME, font=("Microsoft YaHei UI", 16, "bold"))
         title.grid(row=0, column=0, sticky="ew", **pad)
 
-        qr_frame = ttk.Frame(self.root)
-        qr_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=4)
+        qr_frame = ttk.LabelFrame(self.root, text="微信/App 扫码")
+        qr_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
         qr_frame.columnconfigure(0, weight=1)
-        qr_frame.columnconfigure(1, weight=1)
-
-        web_frame = ttk.LabelFrame(qr_frame, text="网页扫码")
-        web_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        web_frame.columnconfigure(0, weight=1)
-        self.web_qr_label = ttk.Label(web_frame, anchor="center")
-        self.web_qr_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-
-        app_frame = ttk.LabelFrame(qr_frame, text="App 配对")
-        app_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        app_frame.columnconfigure(0, weight=1)
-        self.app_qr_label = ttk.Label(app_frame, anchor="center")
-        self.app_qr_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.qr_label = ttk.Label(qr_frame, anchor="center")
+        self.qr_label.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
 
         info_frame = ttk.Frame(self.root)
         info_frame.grid(row=2, column=0, sticky="nsew", **pad)
         info_frame.columnconfigure(1, weight=1)
-        info_frame.rowconfigure(3, weight=1)
 
-        ttk.Label(info_frame, text="网页地址:").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(info_frame, textvariable=self.web_url_var, state="readonly").grid(row=0, column=1, sticky="ew", padx=(8, 0))
-
-        ttk.Label(info_frame, text="App 配对:").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(info_frame, textvariable=self.app_pair_var, state="readonly").grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        ttk.Label(info_frame, text="扫码地址:").grid(row=0, column=0, sticky="w", pady=3)
+        self.scan_entry = ttk.Entry(info_frame, textvariable=self.scan_url_var, state="readonly")
+        self.scan_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.copy_button = ttk.Button(info_frame, text="复制", command=self.copy_scan_url, state=DISABLED)
+        self.copy_button.grid(row=0, column=2, sticky="e", padx=(8, 0))
 
         path_frame = ttk.Frame(info_frame)
-        path_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        path_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 4))
         path_frame.columnconfigure(1, weight=1)
         ttk.Label(path_frame, text="保存目录:").grid(row=0, column=0, sticky="w")
         ttk.Entry(path_frame, textvariable=self.path_var, state="readonly").grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(path_frame, text="更改", command=self.choose_dir).grid(row=0, column=2, sticky="e")
 
         log_frame = ttk.Frame(info_frame)
-        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
-        log_frame.rowconfigure(0, weight=1)
+        log_frame.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
-        self.log = Text(log_frame, height=8, wrap="word", state=DISABLED)
+        self.log = Text(log_frame, height=6, wrap="word", state=DISABLED)
         self.log.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -261,15 +433,31 @@ class PhotoReturnApp:
         return PhotoImage(data=buffer.read())
 
     def refresh_qr_codes(self):
-        current_web_url = web_url()
-        current_app_pair_url = app_pair_url()
-        self.web_url_var.set(current_web_url)
-        self.app_pair_var.set(current_app_pair_url)
+        current_scan_url = web_url()
+        self.scan_url_var.set(current_scan_url)
 
-        self.web_qr_image = self.make_qr_image(current_web_url)
-        self.app_qr_image = self.make_qr_image(current_app_pair_url)
-        self.web_qr_label.configure(image=self.web_qr_image)
-        self.app_qr_label.configure(image=self.app_qr_image)
+        self.qr_image = self.make_qr_image(current_scan_url)
+        self.qr_label.configure(image=self.qr_image)
+        self.copy_button.configure(state=NORMAL)
+
+    def disable_scan_code(self):
+        self.scan_url_var.set("")
+        self.qr_label.configure(image="")
+        self.copy_button.configure(state=DISABLED)
+
+    def center_window(self):
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() - width) // 2
+        y = (self.root.winfo_screenheight() - height) // 2
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.deiconify()
+
+    def copy_scan_url(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.scan_url_var.get())
+        self.status_var.set("扫码地址已复制")
 
     def choose_dir(self):
         global upload_dir
@@ -295,11 +483,25 @@ class PhotoReturnApp:
     def poll_events(self):
         while True:
             try:
-                msg = events.get_nowait()
+                event = events.get_nowait()
             except queue.Empty:
                 break
-            self.status_var.set("收到新照片")
-            self.add_log(msg)
+            if isinstance(event, tuple):
+                event_type, msg = event
+            else:
+                event_type, msg = "message", event
+
+            if event_type == "ready":
+                self.status_var.set(msg)
+                self.refresh_qr_codes()
+                self.add_log(msg)
+            elif event_type == "error":
+                self.status_var.set(msg)
+                self.disable_scan_code()
+                self.add_log(msg)
+            else:
+                self.status_var.set("收到新照片")
+                self.add_log(msg)
         self.root.after(300, self.poll_events)
 
     def run(self):

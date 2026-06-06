@@ -10,6 +10,8 @@ python -m PyInstaller `
   --onefile `
   --windowed `
   --name $ExeName `
+  --icon "assets\icon.ico" `
+  --add-data "assets;assets" `
   --add-data "templates;templates" `
   app.py
 
@@ -17,6 +19,7 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $ProjectDir "dist\$ExeName.exe") -Destination $OutputDir -Force
 $SourceZipItems = @(
   (Join-Path $ProjectDir 'app.py'),
+  (Join-Path $ProjectDir 'assets'),
   (Join-Path $ProjectDir 'templates'),
   (Join-Path $ProjectDir 'requirements.txt'),
   (Join-Path $ProjectDir 'build.ps1'),

@@ -3,8 +3,8 @@
 这是一个本地局域网照片回传工具，电脑端同时兼容网页和 Android App：
 
 - 电脑端启动 Flask 服务，监听 `0.0.0.0:5000`
-- 手机可扫“网页扫码”二维码，直接用浏览器拍照上传
-- Android App 可扫“App 配对”二维码，拿到电脑 IP、端口和 token
+- 微信和 Android App 都扫描同一个二维码
+- 微信扫码后可直接拍照上传，Android App 扫码后会拿到电脑 IP、端口和 token
 - 手机拍照后只上传到当前电脑
 - 照片保存到 `图片\PhonePhotoReturn` 或界面选择的目录
 - 二维码包含一次性 token，没有 token 会被拒绝
