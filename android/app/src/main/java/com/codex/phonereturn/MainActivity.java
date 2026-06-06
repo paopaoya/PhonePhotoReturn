@@ -8,6 +8,8 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.view.Gravity;
+import android.view.OrientationEventListener;
+import android.view.Surface;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -66,11 +68,14 @@ public class MainActivity extends Activity implements LifecycleOwner {
     private ProcessCameraProvider cameraProvider;
     private PreviewView previewView;
     private ImageCapture imageCapture;
+    private ImageAnalysis imageAnalysis;
+    private OrientationEventListener orientationListener;
     private TextView statusText;
     private String pendingCameraAction;
     private boolean scanning;
     private long lastDecodeAttempt;
     private int cameraSessionId;
+    private int targetRotation = Surface.ROTATION_0;
 
     private String baseUrl;
     private String token;
@@ -82,6 +87,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         super.onCreate(savedInstanceState);
         lifecycleRegistry = new LifecycleRegistry(this);
         lifecycleRegistry.setCurrentState(Lifecycle.State.CREATED);
+        setupOrientationListener();
         loadPairing();
         handleIntent(getIntent());
         showHome();
@@ -123,6 +129,9 @@ public class MainActivity extends Activity implements LifecycleOwner {
         stopCamera();
         worker.shutdown();
         cameraExecutor.shutdown();
+        if (orientationListener != null) {
+            orientationListener.disable();
+        }
         lifecycleRegistry.setCurrentState(Lifecycle.State.DESTROYED);
         super.onDestroy();
     }
@@ -155,6 +164,47 @@ public class MainActivity extends Activity implements LifecycleOwner {
         if (pairing != null) {
             savePairing(pairing);
             toast("已完成配对");
+        }
+    }
+
+    private void setupOrientationListener() {
+        orientationListener = new OrientationEventListener(this) {
+            @Override
+            public void onOrientationChanged(int orientation) {
+                int rotation = orientationToSurfaceRotation(orientation);
+                if (rotation != targetRotation) {
+                    targetRotation = rotation;
+                    applyTargetRotation();
+                }
+            }
+        };
+        if (orientationListener.canDetectOrientation()) {
+            orientationListener.enable();
+        }
+    }
+
+    private int orientationToSurfaceRotation(int orientation) {
+        if (orientation == OrientationEventListener.ORIENTATION_UNKNOWN) {
+            return targetRotation;
+        }
+        if (orientation >= 315 || orientation < 45) {
+            return Surface.ROTATION_0;
+        }
+        if (orientation < 135) {
+            return Surface.ROTATION_270;
+        }
+        if (orientation < 225) {
+            return Surface.ROTATION_180;
+        }
+        return Surface.ROTATION_90;
+    }
+
+    private void applyTargetRotation() {
+        if (imageCapture != null) {
+            imageCapture.setTargetRotation(targetRotation);
+        }
+        if (imageAnalysis != null) {
+            imageAnalysis.setTargetRotation(targetRotation);
         }
     }
 
@@ -328,17 +378,20 @@ public class MainActivity extends Activity implements LifecycleOwner {
 
                 CameraSelector cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA;
                 if (scanMode) {
-                    ImageAnalysis analysis = new ImageAnalysis.Builder()
+                    imageAnalysis = new ImageAnalysis.Builder()
                             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .setTargetRotation(targetRotation)
                             .build();
-                    analysis.setAnalyzer(cameraExecutor, this::decodePreviewFrame);
-                    provider.bindToLifecycle(this, cameraSelector, preview, analysis);
+                    imageAnalysis.setAnalyzer(cameraExecutor, this::decodePreviewFrame);
+                    provider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
                     imageCapture = null;
                 } else {
                     imageCapture = new ImageCapture.Builder()
                             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                            .setTargetRotation(targetRotation)
                             .build();
                     provider.bindToLifecycle(this, cameraSelector, preview, imageCapture);
+                    imageAnalysis = null;
                 }
             } catch (Exception e) {
                 setStatus("启动相机失败: " + e.getMessage());
@@ -446,6 +499,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
             return;
         }
         setStatus("正在拍照...");
+        applyTargetRotation();
         File file = new File(getCacheDir(), "photo_" + System.currentTimeMillis() + ".jpg");
         ImageCapture.OutputFileOptions options = new ImageCapture.OutputFileOptions.Builder(file).build();
         imageCapture.takePicture(
@@ -609,6 +663,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         scanning = false;
         cameraSessionId++;
         imageCapture = null;
+        imageAnalysis = null;
         previewView = null;
         if (cameraProvider != null) {
             cameraProvider.unbindAll();
