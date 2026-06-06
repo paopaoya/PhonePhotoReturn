@@ -1,0 +1,4 @@
+Flask==2.3.3
+qrcode==8.1
+Pillow==9.2.0
+pyinstaller==6.8.0

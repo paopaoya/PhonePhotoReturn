@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.spec
+
+# Desktop build outputs
+desktop/build/
+desktop/dist/
+desktop/outputs/
+
+# Android/Gradle
+android/.gradle/
+android/build/
+android/app/build/
+*.iml
+
+# Outputs
+outputs/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

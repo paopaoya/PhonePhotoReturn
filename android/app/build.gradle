@@ -1,0 +1,20 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.codex.phonereturn"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.codex.phonereturn"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+}
+
+dependencies {
+    implementation files("libs/zxing-core-3.5.3.jar")
+}
