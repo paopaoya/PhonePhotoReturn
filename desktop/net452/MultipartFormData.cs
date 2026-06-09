@@ -21,7 +21,7 @@ namespace PhonePhotoReturn
 
             var result = new MultipartFormData();
             var boundaryBytes = Encoding.ASCII.GetBytes("--" + boundary);
-            var indexes = FindAll(body, boundaryBytes);
+            var indexes = FindBoundaryIndexes(body, boundaryBytes);
             for (var i = 0; i < indexes.Count; i++)
             {
                 var start = indexes[i] + boundaryBytes.Length;
@@ -154,7 +154,7 @@ namespace PhonePhotoReturn
             return null;
         }
 
-        private static List<int> FindAll(byte[] haystack, byte[] needle)
+        private static List<int> FindBoundaryIndexes(byte[] haystack, byte[] needle)
         {
             var result = new List<int>();
             var index = 0;
@@ -165,10 +165,26 @@ namespace PhonePhotoReturn
                 {
                     break;
                 }
-                result.Add(found);
+                if (IsBoundaryDelimiter(haystack, found, needle.Length))
+                {
+                    result.Add(found);
+                }
                 index = found + needle.Length;
             }
             return result;
+        }
+
+        private static bool IsBoundaryDelimiter(byte[] haystack, int index, int length)
+        {
+            if (!(index == 0 || (index >= 2 && haystack[index - 2] == '\r' && haystack[index - 1] == '\n')))
+            {
+                return false;
+            }
+
+            var after = index + length;
+            return after >= haystack.Length
+                || (after + 1 < haystack.Length && haystack[after] == '-' && haystack[after + 1] == '-')
+                || (after + 1 < haystack.Length && haystack[after] == '\r' && haystack[after + 1] == '\n');
         }
 
         private static int Find(byte[] haystack, byte[] needle, int start, int end)

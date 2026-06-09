@@ -483,7 +483,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         upload.setOnClickListener(v -> uploadSelectedGalleryPhotos());
         root.addView(upload, buttonParams());
 
-        Button back = button("杩斿洖");
+        Button back = button("\u8fd4\u56de");
         back.setOnClickListener(v -> showHome());
         root.addView(back, buttonParams());
 

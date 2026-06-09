@@ -133,8 +133,7 @@
       files = [file];
       uploadOrder = [file];
       renderSelected();
-      await uploadFiles(uploadOrder);
-      camera.value = "";
+      await uploadFiles([...uploadOrder]);
     });
 
     gallery.addEventListener("change", () => {
@@ -155,6 +154,8 @@
 
     function renderSelected() {
       selected.innerHTML = "";
+      camera.disabled = uploading;
+      gallery.disabled = uploading;
       uploadButton.disabled = !uploadOrder.length || uploading;
 
       files.forEach((file, index) => {
@@ -164,6 +165,7 @@
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
         checkbox.checked = uploadOrder.includes(file);
+        checkbox.disabled = uploading;
         checkbox.addEventListener("change", () => {
           if (checkbox.checked) {
             if (!uploadOrder.includes(file)) uploadOrder.push(file);
@@ -185,6 +187,7 @@
     async function uploadFiles(orderedFiles) {
       if (uploading) return;
       uploading = true;
+      let completed = false;
       renderSelected();
 
       try {
@@ -196,12 +199,18 @@
           await uploadOne(file);
         }
         status.textContent = `上传完成：${orderedFiles.length} 张`;
+        completed = true;
       } catch (error) {
         status.textContent = `上传失败：${error.message}`;
       } finally {
         uploading = false;
+        if (completed) {
+          files = [];
+          uploadOrder = [];
+          gallery.value = "";
+          camera.value = "";
+        }
         renderSelected();
-        camera.value = "";
       }
     }
 
