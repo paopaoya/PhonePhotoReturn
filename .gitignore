@@ -7,6 +7,10 @@ __pycache__/
 desktop/build/
 desktop/dist/
 desktop/outputs/
+desktop/.tools/
+desktop/net452/bin/
+desktop/net452/obj/
+desktop/net452/packages/
 
 # Android/Gradle
 android/.gradle/
