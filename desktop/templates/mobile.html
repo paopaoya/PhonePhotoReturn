@@ -70,33 +70,6 @@
       border-radius: 8px;
       border: 1px solid #d9dee7;
     }
-    #selected {
-      margin-top: 14px;
-      text-align: left;
-    }
-    .item {
-      display: grid;
-      grid-template-columns: auto 1fr;
-      gap: 8px;
-      align-items: start;
-      padding: 10px 0;
-      border-top: 1px solid #edf0f5;
-      color: #263244;
-      font-size: 15px;
-      word-break: break-word;
-    }
-    .item input {
-      width: 20px;
-      height: 20px;
-      margin: 1px 0 0;
-    }
-    .hint {
-      margin: 10px 0 0;
-      color: #6b7280;
-      font-size: 13px;
-      line-height: 1.45;
-      text-align: left;
-    }
   </style>
 </head>
 <body>
@@ -107,10 +80,7 @@
       <input id="camera" name="photo" type="file" accept="image/*" capture="environment">
       <label class="secondary" for="gallery">从相册选择</label>
       <input id="gallery" name="photo" type="file" accept="image/*" multiple>
-      <button id="upload" type="button" disabled>按勾选顺序上传</button>
     </div>
-    <p class="hint">从相册选择后，请按需要上传的顺序勾选照片。</p>
-    <div id="selected"></div>
     <p id="status">准备就绪</p>
     <img id="preview" alt="照片预览">
   </main>
@@ -119,76 +89,31 @@
     const token = "{{ token }}";
     const camera = document.getElementById("camera");
     const gallery = document.getElementById("gallery");
-    const uploadButton = document.getElementById("upload");
-    const selected = document.getElementById("selected");
     const status = document.getElementById("status");
     const preview = document.getElementById("preview");
-    let files = [];
-    let uploadOrder = [];
     let uploading = false;
 
     camera.addEventListener("change", async () => {
       const file = camera.files[0];
       if (!file) return;
-      files = [file];
-      uploadOrder = [file];
-      renderSelected();
-      await uploadFiles([...uploadOrder]);
+      await uploadFiles([file]);
     });
 
-    gallery.addEventListener("change", () => {
-      files = Array.from(gallery.files || []);
-      uploadOrder = [];
-      preview.style.display = "none";
-      renderSelected();
-      status.textContent = files.length ? `已选择 ${files.length} 张，请按上传顺序勾选` : "准备就绪";
+    gallery.addEventListener("change", async () => {
+      const files = Array.from(gallery.files || []);
+      if (!files.length) return;
+      await uploadFiles(files);
     });
 
-    uploadButton.addEventListener("click", async () => {
-      if (!uploadOrder.length) {
-        status.textContent = "请先按顺序勾选照片";
-        return;
-      }
-      await uploadFiles([...uploadOrder]);
-    });
-
-    function renderSelected() {
-      selected.innerHTML = "";
-      camera.disabled = uploading;
-      gallery.disabled = uploading;
-      uploadButton.disabled = !uploadOrder.length || uploading;
-
-      files.forEach((file, index) => {
-        const row = document.createElement("label");
-        row.className = "item";
-
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.checked = uploadOrder.includes(file);
-        checkbox.disabled = uploading;
-        checkbox.addEventListener("change", () => {
-          if (checkbox.checked) {
-            if (!uploadOrder.includes(file)) uploadOrder.push(file);
-          } else {
-            uploadOrder = uploadOrder.filter(item => item !== file);
-          }
-          renderSelected();
-        });
-
-        const order = uploadOrder.indexOf(file);
-        const text = document.createElement("span");
-        text.textContent = order >= 0 ? `${order + 1}. ${file.name}` : `${index + 1}. ${file.name}`;
-
-        row.append(checkbox, text);
-        selected.appendChild(row);
-      });
+    function setInputsDisabled(disabled) {
+      camera.disabled = disabled;
+      gallery.disabled = disabled;
     }
 
     async function uploadFiles(orderedFiles) {
       if (uploading) return;
       uploading = true;
-      let completed = false;
-      renderSelected();
+      setInputsDisabled(true);
 
       try {
         for (let i = 0; i < orderedFiles.length; i++) {
@@ -199,18 +124,13 @@
           await uploadOne(file);
         }
         status.textContent = `上传完成：${orderedFiles.length} 张`;
-        completed = true;
       } catch (error) {
         status.textContent = `上传失败：${error.message}`;
       } finally {
         uploading = false;
-        if (completed) {
-          files = [];
-          uploadOrder = [];
-          gallery.value = "";
-          camera.value = "";
-        }
-        renderSelected();
+        gallery.value = "";
+        camera.value = "";
+        setInputsDisabled(false);
       }
     }
 

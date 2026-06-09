@@ -14,10 +14,8 @@ import android.view.Gravity;
 import android.view.OrientationEventListener;
 import android.view.Surface;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -90,8 +88,6 @@ public class MainActivity extends Activity implements LifecycleOwner {
     private String token;
     private String host;
     private int port;
-    private final ArrayList<GalleryItem> galleryItems = new ArrayList<>();
-    private final ArrayList<GalleryItem> galleryUploadOrder = new ArrayList<>();
     private boolean galleryUploading;
 
     @Override
@@ -264,12 +260,12 @@ public class MainActivity extends Activity implements LifecycleOwner {
         healthButton.setOnClickListener(v -> checkHealth());
         root.addView(healthButton, buttonParams());
 
-        Button cameraButton = button("打开相机");
+        Button cameraButton = button("\u62cd\u7167\u4e0a\u4f20");
         cameraButton.setEnabled(hasPairing());
         cameraButton.setOnClickListener(v -> ensureCameraPermission("camera"));
         root.addView(cameraButton, buttonParams());
 
-        Button galleryButton = button("\u4ece\u76f8\u518c\u4e0a\u4f20");
+        Button galleryButton = button("\u4ece\u76f8\u518c\u9009\u62e9");
         galleryButton.setEnabled(hasPairing());
         galleryButton.setOnClickListener(v -> openGalleryPicker());
         root.addView(galleryButton, buttonParams());
@@ -396,6 +392,10 @@ public class MainActivity extends Activity implements LifecycleOwner {
             showHome();
             return;
         }
+        if (galleryUploading) {
+            setStatus("\u6b63\u5728\u4e0a\u4f20\uff0c\u8bf7\u7a0d\u7b49...");
+            return;
+        }
         stopCamera();
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -406,29 +406,28 @@ public class MainActivity extends Activity implements LifecycleOwner {
     }
 
     private void handleGalleryResult(Intent data) {
-        galleryItems.clear();
-        galleryUploadOrder.clear();
-        galleryUploading = false;
+        ArrayList<GalleryItem> selectedItems = new ArrayList<>();
 
         ClipData clipData = data.getClipData();
         if (clipData != null) {
             for (int i = 0; i < clipData.getItemCount(); i++) {
-                addGalleryItem(clipData.getItemAt(i).getUri());
+                addGalleryItem(selectedItems, clipData.getItemAt(i).getUri());
             }
         } else if (data.getData() != null) {
-            addGalleryItem(data.getData());
+            addGalleryItem(selectedItems, data.getData());
         }
 
-        if (galleryItems.isEmpty()) {
+        if (selectedItems.isEmpty()) {
             toast("\u672a\u9009\u62e9\u7167\u7247");
             showHome();
             return;
         }
 
-        showGallerySelection();
+        showHome();
+        uploadGalleryQueue(selectedItems);
     }
 
-    private void addGalleryItem(Uri uri) {
+    private void addGalleryItem(List<GalleryItem> selectedItems, Uri uri) {
         if (uri == null) {
             return;
         }
@@ -438,90 +437,21 @@ public class MainActivity extends Activity implements LifecycleOwner {
         } catch (Exception ignored) {
         }
 
-        galleryItems.add(new GalleryItem(uri, displayNameForUri(uri), galleryItems.size() + 1));
+        selectedItems.add(new GalleryItem(uri, displayNameForUri(uri)));
     }
 
-    private void showGallerySelection() {
-        stopCamera();
-
-        LinearLayout root = verticalRoot();
-        root.setPadding(dp(16), dp(22), dp(16), dp(16));
-
-        TextView title = text("\u6309\u52fe\u9009\u987a\u5e8f\u4e0a\u4f20", 20, true);
-        root.addView(title, fullWrap());
-
-        TextView help = text("\u5148\u9009\u56fe\uff0c\u518d\u6309\u9700\u8981\u7684\u987a\u5e8f\u52fe\u9009\u3002", 14, false);
-        help.setTextColor(0xFF475569);
-        help.setPadding(0, dp(8), 0, dp(10));
-        root.addView(help, fullWrap());
-
-        ScrollView scrollView = new ScrollView(this);
-        LinearLayout list = new LinearLayout(this);
-        list.setOrientation(LinearLayout.VERTICAL);
-        scrollView.addView(list);
-        root.addView(scrollView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
-
-        for (GalleryItem item : galleryItems) {
-            CheckBox checkBox = new CheckBox(this);
-            checkBox.setText(item.defaultLabel());
-            checkBox.setAllCaps(false);
-            checkBox.setOnCheckedChangeListener((buttonView, isChecked) -> {
-                if (isChecked) {
-                    if (!galleryUploadOrder.contains(item)) {
-                        galleryUploadOrder.add(item);
-                    }
-                } else {
-                    galleryUploadOrder.remove(item);
-                }
-                refreshGalleryLabels();
-            });
-            item.checkBox = checkBox;
-            list.addView(checkBox, fullWrap());
-        }
-
-        Button upload = button("\u6309\u52fe\u9009\u987a\u5e8f\u4e0a\u4f20");
-        upload.setOnClickListener(v -> uploadSelectedGalleryPhotos());
-        root.addView(upload, buttonParams());
-
-        Button back = button("\u8fd4\u56de");
-        back.setOnClickListener(v -> showHome());
-        root.addView(back, buttonParams());
-
-        statusText = text("\u5df2\u9009\u62e9 " + galleryItems.size() + " \u5f20", 14, false);
-        statusText.setTextColor(0xFF2563EB);
-        root.addView(statusText, fullWrap());
-
-        setContentView(root);
-    }
-
-    private void refreshGalleryLabels() {
-        for (GalleryItem item : galleryItems) {
-            int order = galleryUploadOrder.indexOf(item);
-            item.checkBox.setText(order >= 0 ? (order + 1) + ". " + item.name : item.defaultLabel());
-        }
-        if (statusText != null) {
-            statusText.setText("\u5df2\u52fe\u9009 " + galleryUploadOrder.size() + " / " + galleryItems.size());
-        }
-    }
-
-    private void uploadSelectedGalleryPhotos() {
+    private void uploadGalleryQueue(List<GalleryItem> ordered) {
         if (galleryUploading) {
             setStatus("\u6b63\u5728\u4e0a\u4f20\uff0c\u8bf7\u7a0d\u7b49...");
             return;
         }
 
-        if (galleryUploadOrder.isEmpty()) {
-            setStatus("\u8bf7\u5148\u52fe\u9009\u8981\u4e0a\u4f20\u7684\u7167\u7247");
-            return;
-        }
-
-        ArrayList<GalleryItem> ordered = new ArrayList<>(galleryUploadOrder);
         galleryUploading = true;
         setStatus("\u51c6\u5907\u4e0a\u4f20 " + ordered.size() + " \u5f20...");
-        worker.execute(() -> uploadGalleryQueue(ordered));
+        worker.execute(() -> uploadGalleryItems(ordered));
     }
 
-    private void uploadGalleryQueue(List<GalleryItem> ordered) {
+    private void uploadGalleryItems(List<GalleryItem> ordered) {
         int success = 0;
         for (int i = 0; i < ordered.size(); i++) {
             GalleryItem item = ordered.get(i);
@@ -1087,17 +1017,10 @@ public class MainActivity extends Activity implements LifecycleOwner {
     private static class GalleryItem {
         final Uri uri;
         final String name;
-        final int pickerOrder;
-        CheckBox checkBox;
 
-        GalleryItem(Uri uri, String name, int pickerOrder) {
+        GalleryItem(Uri uri, String name) {
             this.uri = uri;
             this.name = name;
-            this.pickerOrder = pickerOrder;
-        }
-
-        String defaultLabel() {
-            return pickerOrder + ". " + name;
         }
     }
 

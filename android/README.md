@@ -10,7 +10,7 @@ Android client for the PhonePhotoReturn desktop receiver.
 4. Tap camera, then tap capture.
 5. The app uploads the photo directly to the PC receiver.
 
-You can also tap gallery upload, choose one or more photos from the system picker, then check them in the exact order they should be uploaded.
+You can also tap gallery upload and choose one or more photos from the system picker. After you tap Done in the picker, the app uploads them directly in the picker order.
 
 The app uses CameraX for camera preview/capture, ZXing for QR scanning, and HttpURLConnection for upload.
 
