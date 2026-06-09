@@ -70,7 +70,7 @@ namespace PhonePhotoReturn
                 }
                 else if (string.Equals(name, "photo", StringComparison.OrdinalIgnoreCase))
                 {
-                    result.FileName = ReadDispositionValue(disposition, "filename");
+                    result.FileName = ReadDispositionValue(disposition, "filename*") ?? ReadDispositionValue(disposition, "filename");
                     result.FileBytes = new byte[dataLength];
                     Buffer.BlockCopy(body, dataStart, result.FileBytes, 0, dataLength);
                 }
@@ -147,6 +147,10 @@ namespace PhonePhotoReturn
                 if (value.Length >= 2 && value[0] == '"' && value[value.Length - 1] == '"')
                 {
                     value = value.Substring(1, value.Length - 2);
+                }
+                if (name.EndsWith("*", StringComparison.Ordinal) && value.StartsWith("UTF-8''", StringComparison.OrdinalIgnoreCase))
+                {
+                    return Uri.UnescapeDataString(value.Substring("UTF-8''".Length));
                 }
                 return value.Replace("\\\"", "\"");
             }

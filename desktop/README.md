@@ -11,7 +11,7 @@ The original Python implementation is still kept in this folder:
 
 ## Receiver Behavior
 
-- Listens on `0.0.0.0:5000`.
+- Listens on `0.0.0.0:36666`.
 - Shows a QR code for WeChat/browser uploads.
 - Exposes `/pair.json` for the Android client.
 - Receives `POST /upload` multipart uploads with field name `photo`.

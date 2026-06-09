@@ -48,8 +48,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -68,6 +70,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
     private static final String KEY_TOKEN = "token";
     private static final String KEY_HOST = "host";
     private static final String KEY_PORT = "port";
+    private static final int DEFAULT_PORT = 36666;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
@@ -305,7 +308,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         EditText input = new EditText(this);
         input.setMinLines(4);
         input.setGravity(Gravity.TOP | Gravity.START);
-        input.setHint("photoreturn://pair?... 或 http://电脑IP:5000/?token=...");
+        input.setHint("photoreturn://pair?... 或 http://电脑IP:36666/?token=...");
         root.addView(input, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(140)));
 
         Button save = button("保存配对");
@@ -707,7 +710,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
 
             OutputStream out = conn.getOutputStream();
             writeAscii(out, "--" + boundary + "\r\n");
-            writeAscii(out, "Content-Disposition: form-data; name=\"photo\"; filename=\"" + safeUploadFileName(source.fileName()) + "\"\r\n");
+            writeAscii(out, "Content-Disposition: form-data; name=\"photo\"; filename=\"" + fallbackUploadFileName(source.fileName()) + "\"; filename*=UTF-8''" + encodeHeaderFileName(source.fileName()) + "\r\n");
             writeAscii(out, "Content-Type: image/jpeg\r\n\r\n");
             InputStream in = source.open();
             try {
@@ -791,7 +794,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
                 if (parsedBaseUrl.isEmpty() || parsedToken.isEmpty()) {
                     return null;
                 }
-                return new Pairing(parsedBaseUrl, parsedToken, json.optString("host"), json.optInt("port", 5000));
+                return new Pairing(parsedBaseUrl, parsedToken, json.optString("host"), json.optInt("port", DEFAULT_PORT));
             }
 
             Uri uri = Uri.parse(text);
@@ -799,7 +802,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
                 String parsedBaseUrl = uri.getQueryParameter("base_url");
                 String parsedHost = uri.getQueryParameter("host");
                 String parsedToken = uri.getQueryParameter("token");
-                int parsedPort = parsePort(uri.getQueryParameter("port"), 5000);
+                int parsedPort = parsePort(uri.getQueryParameter("port"), DEFAULT_PORT);
                 if ((parsedBaseUrl == null || parsedBaseUrl.isEmpty()) && parsedHost != null && !parsedHost.isEmpty()) {
                     parsedBaseUrl = "http://" + parsedHost + ":" + parsedPort;
                 }
@@ -912,7 +915,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         return "gallery_" + System.currentTimeMillis() + ".jpg";
     }
 
-    private String safeUploadFileName(String name) {
+    private String fallbackUploadFileName(String name) {
         if (name == null || name.trim().isEmpty()) {
             return "photo.jpg";
         }
@@ -932,6 +935,17 @@ public class MainActivity extends Activity implements LifecycleOwner {
         }
         String safeName = builder.toString();
         return safeName.trim().isEmpty() ? "photo.jpg" : safeName;
+    }
+
+    private String encodeHeaderFileName(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            name = "photo.jpg";
+        }
+        try {
+            return URLEncoder.encode(name, StandardCharsets.UTF_8.name()).replace("+", "%20");
+        } catch (Exception e) {
+            return "photo.jpg";
+        }
     }
 
     private LinearLayout verticalRoot() {

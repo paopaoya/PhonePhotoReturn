@@ -13,7 +13,7 @@ namespace PhonePhotoReturn
 {
     internal sealed class PhotoServer : IDisposable
     {
-        public const int Port = 5000;
+        public const int Port = 36666;
         private static readonly HashSet<string> AllowedExtensions = new HashSet<string>(
             new[] { ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic" },
             StringComparer.OrdinalIgnoreCase);
@@ -268,15 +268,21 @@ namespace PhonePhotoReturn
         private string SavePhoto(string originalName, byte[] bytes)
         {
             Directory.CreateDirectory(UploadDirectory);
-            var suffix = Path.GetExtension(SanitizeFileName(originalName));
+            var safeName = BuildSafeFileName(originalName);
+            var suffix = Path.GetExtension(safeName);
             if (string.IsNullOrEmpty(suffix) || !AllowedExtensions.Contains(suffix))
             {
                 suffix = ".jpg";
             }
+            var stem = Path.GetFileNameWithoutExtension(safeName);
+            if (string.IsNullOrWhiteSpace(stem))
+            {
+                stem = "photo";
+            }
 
             for (var i = 0; i < 100; i++)
             {
-                var fileName = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss_fffffff") + "_" + Guid.NewGuid().ToString("N").Substring(0, 8) + suffix.ToLowerInvariant();
+                var fileName = i == 0 ? stem + suffix : stem + "(" + i + ")" + suffix;
                 var path = Path.Combine(UploadDirectory, fileName);
                 try
                 {
@@ -536,18 +542,19 @@ namespace PhonePhotoReturn
             return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
         }
 
-        private static string SanitizeFileName(string fileName)
+        private static string BuildSafeFileName(string fileName)
         {
             if (string.IsNullOrEmpty(fileName))
             {
-                return "";
+                return "photo.jpg";
             }
 
+            fileName = fileName.Trim().Replace('/', '_').Replace('\\', '_');
             foreach (var invalid in Path.GetInvalidFileNameChars())
             {
                 fileName = fileName.Replace(invalid, '_');
             }
-            return fileName;
+            return string.IsNullOrWhiteSpace(fileName) ? "photo.jpg" : fileName;
         }
 
         private static string JsonEscape(string value)

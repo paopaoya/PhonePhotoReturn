@@ -8,7 +8,6 @@ import socket
 import sys
 import threading
 import time
-import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -17,11 +16,10 @@ from tkinter import END, DISABLED, NORMAL, StringVar, Text, Tk, filedialog, ttk
 import qrcode
 from flask import Flask, abort, jsonify, render_template, request
 from werkzeug.serving import make_server
-from werkzeug.utils import secure_filename
 
 
 APP_NAME = "手机拍照自动回传电脑"
-PORT = 5000
+PORT = 36666
 TOKEN = secrets.token_urlsafe(18)
 DEFAULT_UPLOAD_DIR = Path.home() / "Pictures" / "PhonePhotoReturn"
 SETTINGS_ROOT = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
@@ -280,8 +278,17 @@ def allowed_file(filename):
     return suffix in ALLOWED_EXTENSIONS or not suffix
 
 
+def safe_original_file_name(original_name):
+    name = str(original_name or "").strip()
+    if not name:
+        return "photo.jpg"
+    for invalid in '<>:"/\\|?*':
+        name = name.replace(invalid, "_")
+    return name or "photo.jpg"
+
+
 def photo_suffix(original_name):
-    original_name = secure_filename(original_name or "")
+    original_name = safe_original_file_name(original_name)
     suffix = Path(original_name).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         suffix = ".jpg"
@@ -290,11 +297,12 @@ def photo_suffix(original_name):
 
 def reserve_photo_file(original_name):
     ensure_upload_dir()
-    suffix = photo_suffix(original_name)
-    for _ in range(100):
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-        random_part = uuid.uuid4().hex[:8]
-        photo_path = upload_dir / f"{timestamp}_{random_part}{suffix}"
+    safe_name = safe_original_file_name(original_name)
+    suffix = photo_suffix(safe_name)
+    stem = Path(safe_name).stem or "photo"
+    for index in range(100):
+        file_name = f"{stem}{suffix}" if index == 0 else f"{stem}({index}){suffix}"
+        photo_path = upload_dir / file_name
         try:
             return photo_path, photo_path.open("xb")
         except FileExistsError:
