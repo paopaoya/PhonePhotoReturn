@@ -18,8 +18,8 @@
       color: #172033;
     }
     main {
-      width: min(92vw, 420px);
-      padding: 24px;
+      width: min(92vw, 440px);
+      padding: 22px;
       background: #fff;
       border: 1px solid #d9dee7;
       border-radius: 8px;
@@ -27,75 +27,195 @@
       text-align: center;
     }
     h1 {
-      margin: 0 0 18px;
+      margin: 0 0 16px;
       font-size: 24px;
       letter-spacing: 0;
     }
-    label {
+    .actions {
+      display: grid;
+      gap: 10px;
+    }
+    label,
+    button {
       display: block;
-      padding: 16px 18px;
+      width: 100%;
+      box-sizing: border-box;
+      padding: 14px 16px;
+      border: 0;
       border-radius: 8px;
       background: #1967d2;
       color: #fff;
-      font-size: 18px;
+      font-size: 17px;
       font-weight: 600;
     }
-    input {
+    button.secondary,
+    label.secondary {
+      background: #334155;
+    }
+    button:disabled {
+      background: #9aa7b8;
+    }
+    input[type="file"] {
       display: none;
     }
     #status {
       min-height: 24px;
-      margin: 18px 0 0;
+      margin: 16px 0 0;
       color: #5b6575;
     }
     #preview {
       display: none;
       width: 100%;
-      margin-top: 18px;
+      margin-top: 14px;
       border-radius: 8px;
       border: 1px solid #d9dee7;
+    }
+    #selected {
+      margin-top: 14px;
+      text-align: left;
+    }
+    .item {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px;
+      align-items: start;
+      padding: 10px 0;
+      border-top: 1px solid #edf0f5;
+      color: #263244;
+      font-size: 15px;
+      word-break: break-word;
+    }
+    .item input {
+      width: 20px;
+      height: 20px;
+      margin: 1px 0 0;
+    }
+    .hint {
+      margin: 10px 0 0;
+      color: #6b7280;
+      font-size: 13px;
+      line-height: 1.45;
+      text-align: left;
     }
   </style>
 </head>
 <body>
   <main>
     <h1>拍照回传电脑</h1>
-    <label for="photo">点击拍照</label>
-    <input id="photo" name="photo" type="file" accept="image/*" capture="environment">
+    <div class="actions">
+      <label for="camera">拍照上传</label>
+      <input id="camera" name="photo" type="file" accept="image/*" capture="environment">
+      <label class="secondary" for="gallery">从相册选择</label>
+      <input id="gallery" name="photo" type="file" accept="image/*" multiple>
+      <button id="upload" type="button" disabled>按勾选顺序上传</button>
+    </div>
+    <p class="hint">从相册选择后，请按需要上传的顺序勾选照片。</p>
+    <div id="selected"></div>
     <p id="status">准备就绪</p>
     <img id="preview" alt="照片预览">
   </main>
 
   <script>
     const token = "{{ token }}";
-    const input = document.getElementById("photo");
+    const camera = document.getElementById("camera");
+    const gallery = document.getElementById("gallery");
+    const uploadButton = document.getElementById("upload");
+    const selected = document.getElementById("selected");
     const status = document.getElementById("status");
     const preview = document.getElementById("preview");
+    let files = [];
+    let uploadOrder = [];
+    let uploading = false;
 
-    input.addEventListener("change", async () => {
-      const file = input.files[0];
+    camera.addEventListener("change", async () => {
+      const file = camera.files[0];
       if (!file) return;
+      files = [file];
+      uploadOrder = [file];
+      renderSelected();
+      await uploadFiles(uploadOrder);
+      camera.value = "";
+    });
 
-      preview.src = URL.createObjectURL(file);
-      preview.style.display = "block";
-      status.textContent = "正在上传...";
+    gallery.addEventListener("change", () => {
+      files = Array.from(gallery.files || []);
+      uploadOrder = [];
+      preview.style.display = "none";
+      renderSelected();
+      status.textContent = files.length ? `已选择 ${files.length} 张，请按上传顺序勾选` : "准备就绪";
+    });
 
+    uploadButton.addEventListener("click", async () => {
+      if (!uploadOrder.length) {
+        status.textContent = "请先按顺序勾选照片";
+        return;
+      }
+      await uploadFiles([...uploadOrder]);
+    });
+
+    function renderSelected() {
+      selected.innerHTML = "";
+      uploadButton.disabled = !uploadOrder.length || uploading;
+
+      files.forEach((file, index) => {
+        const row = document.createElement("label");
+        row.className = "item";
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = uploadOrder.includes(file);
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) {
+            if (!uploadOrder.includes(file)) uploadOrder.push(file);
+          } else {
+            uploadOrder = uploadOrder.filter(item => item !== file);
+          }
+          renderSelected();
+        });
+
+        const order = uploadOrder.indexOf(file);
+        const text = document.createElement("span");
+        text.textContent = order >= 0 ? `${order + 1}. ${file.name}` : `${index + 1}. ${file.name}`;
+
+        row.append(checkbox, text);
+        selected.appendChild(row);
+      });
+    }
+
+    async function uploadFiles(orderedFiles) {
+      if (uploading) return;
+      uploading = true;
+      renderSelected();
+
+      try {
+        for (let i = 0; i < orderedFiles.length; i++) {
+          const file = orderedFiles[i];
+          preview.src = URL.createObjectURL(file);
+          preview.style.display = "block";
+          status.textContent = `正在上传 ${i + 1} / ${orderedFiles.length}: ${file.name}`;
+          await uploadOne(file);
+        }
+        status.textContent = `上传完成：${orderedFiles.length} 张`;
+      } catch (error) {
+        status.textContent = `上传失败：${error.message}`;
+      } finally {
+        uploading = false;
+        renderSelected();
+        camera.value = "";
+      }
+    }
+
+    async function uploadOne(file) {
       const form = new FormData();
       form.append("token", token);
       form.append("photo", file);
 
-      try {
-        const response = await fetch(`/upload?token=${encodeURIComponent(token)}`, {
-          method: "POST",
-          body: form
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        status.textContent = "上传成功";
-        input.value = "";
-      } catch (error) {
-        status.textContent = "上传失败，请检查网络";
-      }
-    });
+      const response = await fetch(`/upload?token=${encodeURIComponent(token)}`, {
+        method: "POST",
+        body: form
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    }
   </script>
 </body>
 </html>
