@@ -255,6 +255,7 @@ namespace PhonePhotoReturn
 
                 _server.UploadDirectory = dialog.SelectedPath;
                 Directory.CreateDirectory(_server.UploadDirectory);
+                SettingsStore.SaveUploadDirectory(_server.UploadDirectory);
                 UpdateUploadDirectoryText();
                 AddLog("\u4fdd\u5b58\u76ee\u5f55\u5df2\u5207\u6362: " + _server.UploadDirectory);
             }

@@ -16,7 +16,7 @@ The original Python implementation is still kept in this folder:
 - Exposes `/pair.json` for the Android client.
 - Receives `POST /upload` multipart uploads with field name `photo`.
 - Accepts the token from `?token=...`, form field `token`, or `Authorization: Bearer <token>`.
-- Saves photos to `Pictures\PhonePhotoReturn` unless changed in the UI.
+- Saves photos to the last directory selected in the UI, falling back to `Pictures\PhonePhotoReturn` on first launch.
 
 ## Build .NET 4.5.2
 

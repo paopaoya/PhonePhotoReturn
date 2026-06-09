@@ -1,6 +1,7 @@
 import ctypes
 import io
 import ipaddress
+import os
 import queue
 import secrets
 import socket
@@ -23,9 +24,37 @@ APP_NAME = "手机拍照自动回传电脑"
 PORT = 5000
 TOKEN = secrets.token_urlsafe(18)
 DEFAULT_UPLOAD_DIR = Path.home() / "Pictures" / "PhonePhotoReturn"
+SETTINGS_ROOT = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+SETTINGS_FILE = SETTINGS_ROOT / "PhonePhotoReturn" / "settings.txt"
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}
 
-upload_dir = DEFAULT_UPLOAD_DIR
+
+def is_usable_upload_dir(path):
+    return bool(path and str(path).strip())
+
+
+def load_upload_dir():
+    try:
+        if SETTINGS_FILE.exists():
+            for line in SETTINGS_FILE.read_text(encoding="utf-8").splitlines():
+                if line.lower().startswith("upload_directory="):
+                    directory = line.split("=", 1)[1].strip()
+                    if is_usable_upload_dir(directory):
+                        return Path(directory)
+    except OSError:
+        pass
+    return DEFAULT_UPLOAD_DIR
+
+
+def save_upload_dir(path):
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(f"upload_directory={path}", encoding="utf-8")
+    except OSError:
+        pass
+
+
+upload_dir = load_upload_dir()
 events = queue.Queue()
 server_ready = threading.Event()
 
@@ -466,6 +495,7 @@ class PhotoReturnApp:
             return
         upload_dir = Path(directory)
         ensure_upload_dir()
+        save_upload_dir(upload_dir)
         self.path_var.set(str(upload_dir))
         self.add_log(f"保存目录已切换: {upload_dir}")
 

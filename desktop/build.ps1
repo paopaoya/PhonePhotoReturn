@@ -79,6 +79,7 @@ $sourceZipItems = @(
   (Join-Path $NetProjectDir 'MultipartFormData.cs'),
   (Join-Path $NetProjectDir 'PhotoServer.cs'),
   (Join-Path $NetProjectDir 'Program.cs'),
+  (Join-Path $NetProjectDir 'SettingsStore.cs'),
   (Join-Path $NetProjectDir 'Properties')
 )
 

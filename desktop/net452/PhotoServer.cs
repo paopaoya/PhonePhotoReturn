@@ -33,9 +33,7 @@ namespace PhonePhotoReturn
         {
             _context = SynchronizationContext.Current;
             Token = CreateToken();
-            UploadDirectory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
-                "PhonePhotoReturn");
+            UploadDirectory = SettingsStore.LoadUploadDirectory();
         }
 
         public string Token { get; private set; }
