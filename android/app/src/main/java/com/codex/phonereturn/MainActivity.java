@@ -2,17 +2,22 @@ package com.codex.phonereturn;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.ClipData;
+import android.database.Cursor;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.OrientationEventListener;
 import android.view.Surface;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -42,11 +47,14 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -56,6 +64,7 @@ import com.google.common.util.concurrent.ListenableFuture;
 
 public class MainActivity extends Activity implements LifecycleOwner {
     private static final int REQUEST_CAMERA = 1001;
+    private static final int REQUEST_PICK_GALLERY = 1002;
     private static final String PREFS = "phone_photo_return";
     private static final String KEY_BASE_URL = "base_url";
     private static final String KEY_TOKEN = "token";
@@ -81,6 +90,9 @@ public class MainActivity extends Activity implements LifecycleOwner {
     private String token;
     private String host;
     private int port;
+    private final ArrayList<GalleryItem> galleryItems = new ArrayList<>();
+    private final ArrayList<GalleryItem> galleryUploadOrder = new ArrayList<>();
+    private boolean galleryUploading;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -154,6 +166,18 @@ public class MainActivity extends Activity implements LifecycleOwner {
             toast("需要相机权限");
         }
         pendingCameraAction = null;
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_PICK_GALLERY) {
+            if (resultCode == RESULT_OK && data != null) {
+                handleGalleryResult(data);
+            } else {
+                showHome();
+            }
+        }
     }
 
     private void handleIntent(Intent intent) {
@@ -244,6 +268,11 @@ public class MainActivity extends Activity implements LifecycleOwner {
         cameraButton.setEnabled(hasPairing());
         cameraButton.setOnClickListener(v -> ensureCameraPermission("camera"));
         root.addView(cameraButton, buttonParams());
+
+        Button galleryButton = button("\u4ece\u76f8\u518c\u4e0a\u4f20");
+        galleryButton.setEnabled(hasPairing());
+        galleryButton.setOnClickListener(v -> openGalleryPicker());
+        root.addView(galleryButton, buttonParams());
 
         Button clearButton = button("清除配对");
         clearButton.setOnClickListener(v -> {
@@ -359,6 +388,173 @@ public class MainActivity extends Activity implements LifecycleOwner {
 
         setContentView(root);
         startCamera(false);
+    }
+
+    private void openGalleryPicker() {
+        if (!hasPairing()) {
+            toast("\u8bf7\u5148\u626b\u7801\u914d\u5bf9");
+            showHome();
+            return;
+        }
+        stopCamera();
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(intent, REQUEST_PICK_GALLERY);
+    }
+
+    private void handleGalleryResult(Intent data) {
+        galleryItems.clear();
+        galleryUploadOrder.clear();
+        galleryUploading = false;
+
+        ClipData clipData = data.getClipData();
+        if (clipData != null) {
+            for (int i = 0; i < clipData.getItemCount(); i++) {
+                addGalleryItem(clipData.getItemAt(i).getUri());
+            }
+        } else if (data.getData() != null) {
+            addGalleryItem(data.getData());
+        }
+
+        if (galleryItems.isEmpty()) {
+            toast("\u672a\u9009\u62e9\u7167\u7247");
+            showHome();
+            return;
+        }
+
+        showGallerySelection();
+    }
+
+    private void addGalleryItem(Uri uri) {
+        if (uri == null) {
+            return;
+        }
+
+        try {
+            getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (Exception ignored) {
+        }
+
+        galleryItems.add(new GalleryItem(uri, displayNameForUri(uri), galleryItems.size() + 1));
+    }
+
+    private void showGallerySelection() {
+        stopCamera();
+
+        LinearLayout root = verticalRoot();
+        root.setPadding(dp(16), dp(22), dp(16), dp(16));
+
+        TextView title = text("\u6309\u52fe\u9009\u987a\u5e8f\u4e0a\u4f20", 20, true);
+        root.addView(title, fullWrap());
+
+        TextView help = text("\u5148\u9009\u56fe\uff0c\u518d\u6309\u9700\u8981\u7684\u987a\u5e8f\u52fe\u9009\u3002", 14, false);
+        help.setTextColor(0xFF475569);
+        help.setPadding(0, dp(8), 0, dp(10));
+        root.addView(help, fullWrap());
+
+        ScrollView scrollView = new ScrollView(this);
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        scrollView.addView(list);
+        root.addView(scrollView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+
+        for (GalleryItem item : galleryItems) {
+            CheckBox checkBox = new CheckBox(this);
+            checkBox.setText(item.defaultLabel());
+            checkBox.setAllCaps(false);
+            checkBox.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                if (isChecked) {
+                    if (!galleryUploadOrder.contains(item)) {
+                        galleryUploadOrder.add(item);
+                    }
+                } else {
+                    galleryUploadOrder.remove(item);
+                }
+                refreshGalleryLabels();
+            });
+            item.checkBox = checkBox;
+            list.addView(checkBox, fullWrap());
+        }
+
+        Button upload = button("\u6309\u52fe\u9009\u987a\u5e8f\u4e0a\u4f20");
+        upload.setOnClickListener(v -> uploadSelectedGalleryPhotos());
+        root.addView(upload, buttonParams());
+
+        Button back = button("杩斿洖");
+        back.setOnClickListener(v -> showHome());
+        root.addView(back, buttonParams());
+
+        statusText = text("\u5df2\u9009\u62e9 " + galleryItems.size() + " \u5f20", 14, false);
+        statusText.setTextColor(0xFF2563EB);
+        root.addView(statusText, fullWrap());
+
+        setContentView(root);
+    }
+
+    private void refreshGalleryLabels() {
+        for (GalleryItem item : galleryItems) {
+            int order = galleryUploadOrder.indexOf(item);
+            item.checkBox.setText(order >= 0 ? (order + 1) + ". " + item.name : item.defaultLabel());
+        }
+        if (statusText != null) {
+            statusText.setText("\u5df2\u52fe\u9009 " + galleryUploadOrder.size() + " / " + galleryItems.size());
+        }
+    }
+
+    private void uploadSelectedGalleryPhotos() {
+        if (galleryUploading) {
+            setStatus("\u6b63\u5728\u4e0a\u4f20\uff0c\u8bf7\u7a0d\u7b49...");
+            return;
+        }
+
+        if (galleryUploadOrder.isEmpty()) {
+            setStatus("\u8bf7\u5148\u52fe\u9009\u8981\u4e0a\u4f20\u7684\u7167\u7247");
+            return;
+        }
+
+        ArrayList<GalleryItem> ordered = new ArrayList<>(galleryUploadOrder);
+        galleryUploading = true;
+        setStatus("\u51c6\u5907\u4e0a\u4f20 " + ordered.size() + " \u5f20...");
+        worker.execute(() -> uploadGalleryQueue(ordered));
+    }
+
+    private void uploadGalleryQueue(List<GalleryItem> ordered) {
+        int success = 0;
+        for (int i = 0; i < ordered.size(); i++) {
+            GalleryItem item = ordered.get(i);
+            int current = i + 1;
+            int total = ordered.size();
+            runOnUiThread(() -> setStatus("\u6b63\u5728\u4e0a\u4f20 " + current + " / " + total + ": " + item.name));
+            try {
+                int code = uploadSource(new UriUploadSource(item.uri, item.name));
+                if (code >= 200 && code < 300) {
+                    success++;
+                } else {
+                    int failedAt = current;
+                    runOnUiThread(() -> {
+                        galleryUploading = false;
+                        setStatus("\u7b2c " + failedAt + " \u5f20\u4e0a\u4f20\u5931\u8d25: HTTP " + code);
+                    });
+                    return;
+                }
+            } catch (Exception e) {
+                int failedAt = current;
+                runOnUiThread(() -> {
+                    galleryUploading = false;
+                    setStatus("\u7b2c " + failedAt + " \u5f20\u4e0a\u4f20\u5931\u8d25: " + e.getMessage());
+                });
+                return;
+            }
+        }
+
+        int uploaded = success;
+        runOnUiThread(() -> {
+            galleryUploading = false;
+            setStatus("\u4e0a\u4f20\u5b8c\u6210: " + uploaded + " \u5f20");
+        });
     }
 
     private void startCamera(boolean scanMode) {
@@ -566,6 +762,45 @@ public class MainActivity extends Activity implements LifecycleOwner {
         });
     }
 
+    private int uploadSource(UploadSource source) throws IOException {
+        String boundary = "----PhonePhotoReturn" + System.currentTimeMillis();
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(baseUrl + "/upload");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(15000);
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+
+            OutputStream out = conn.getOutputStream();
+            writeAscii(out, "--" + boundary + "\r\n");
+            writeAscii(out, "Content-Disposition: form-data; name=\"photo\"; filename=\"" + safeUploadFileName(source.fileName()) + "\"\r\n");
+            writeAscii(out, "Content-Type: image/jpeg\r\n\r\n");
+            InputStream in = source.open();
+            try {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                }
+            } finally {
+                in.close();
+            }
+            writeAscii(out, "\r\n--" + boundary + "--\r\n");
+            out.flush();
+            out.close();
+
+            return conn.getResponseCode();
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
     private void checkHealth() {
         if (!hasPairing()) {
             setStatus("请先扫码配对");
@@ -725,6 +960,50 @@ public class MainActivity extends Activity implements LifecycleOwner {
         out.write(value.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
     }
 
+    private String displayNameForUri(Uri uri) {
+        Cursor cursor = null;
+        try {
+            cursor = getContentResolver().query(uri, null, null, null, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) {
+                    String name = cursor.getString(index);
+                    if (name != null && !name.trim().isEmpty()) {
+                        return name;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return "gallery_" + System.currentTimeMillis() + ".jpg";
+    }
+
+    private String safeUploadFileName(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            return "photo.jpg";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < name.length(); i++) {
+            char ch = name.charAt(i);
+            if ((ch >= 'a' && ch <= 'z')
+                    || (ch >= 'A' && ch <= 'Z')
+                    || (ch >= '0' && ch <= '9')
+                    || ch == '.'
+                    || ch == '_'
+                    || ch == '-') {
+                builder.append(ch);
+            } else {
+                builder.append('_');
+            }
+        }
+        String safeName = builder.toString();
+        return safeName.trim().isEmpty() ? "photo.jpg" : safeName;
+    }
+
     private LinearLayout verticalRoot() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -773,6 +1052,53 @@ public class MainActivity extends Activity implements LifecycleOwner {
 
     private void toast(String message) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+    }
+
+    private interface UploadSource {
+        String fileName();
+
+        InputStream open() throws IOException;
+    }
+
+    private class UriUploadSource implements UploadSource {
+        private final Uri uri;
+        private final String name;
+
+        UriUploadSource(Uri uri, String name) {
+            this.uri = uri;
+            this.name = name;
+        }
+
+        @Override
+        public String fileName() {
+            return name;
+        }
+
+        @Override
+        public InputStream open() throws IOException {
+            InputStream input = getContentResolver().openInputStream(uri);
+            if (input == null) {
+                throw new IOException("Cannot open selected image.");
+            }
+            return input;
+        }
+    }
+
+    private static class GalleryItem {
+        final Uri uri;
+        final String name;
+        final int pickerOrder;
+        CheckBox checkBox;
+
+        GalleryItem(Uri uri, String name, int pickerOrder) {
+            this.uri = uri;
+            this.name = name;
+            this.pickerOrder = pickerOrder;
+        }
+
+        String defaultLabel() {
+            return pickerOrder + ". " + name;
+        }
     }
 
     private static class Pairing {
