@@ -52,7 +52,9 @@ import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -629,7 +631,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         }
         setStatus("正在拍照...");
         applyTargetRotation();
-        File file = new File(getCacheDir(), "photo_" + System.currentTimeMillis() + ".jpg");
+        File file = new File(getCacheDir(), currentPhotoFileName());
         ImageCapture.OutputFileOptions options = new ImageCapture.OutputFileOptions.Builder(file).build();
         imageCapture.takePicture(
                 options,
@@ -946,6 +948,10 @@ public class MainActivity extends Activity implements LifecycleOwner {
         } catch (Exception e) {
             return "photo.jpg";
         }
+    }
+
+    private String currentPhotoFileName() {
+        return new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date()) + ".jpg";
     }
 
     private LinearLayout verticalRoot() {
