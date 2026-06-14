@@ -8,8 +8,19 @@ namespace PhonePhotoReturn
     internal sealed class MultipartFormData
     {
         public string Token;
+        public string FieldName;
         public string FileName;
         public byte[] FileBytes;
+
+        public bool IsPhoto
+        {
+            get { return string.Equals(FieldName, "photo", StringComparison.OrdinalIgnoreCase); }
+        }
+
+        public bool IsFile
+        {
+            get { return string.Equals(FieldName, "file", StringComparison.OrdinalIgnoreCase); }
+        }
 
         public static MultipartFormData Parse(byte[] body, string contentType)
         {
@@ -68,8 +79,10 @@ namespace PhonePhotoReturn
                 {
                     result.Token = Encoding.UTF8.GetString(body, dataStart, dataLength).Trim();
                 }
-                else if (string.Equals(name, "photo", StringComparison.OrdinalIgnoreCase))
+                else if (string.Equals(name, "photo", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(name, "file", StringComparison.OrdinalIgnoreCase))
                 {
+                    result.FieldName = name;
                     result.FileName = ReadDispositionValue(disposition, "filename*") ?? ReadDispositionValue(disposition, "filename");
                     result.FileBytes = new byte[dataLength];
                     Buffer.BlockCopy(body, dataStart, result.FileBytes, 0, dataLength);
@@ -86,7 +99,7 @@ namespace PhonePhotoReturn
                 return null;
             }
 
-            var parts = contentType.Split(';');
+            var parts = SplitHeaderParts(contentType);
             foreach (var rawPart in parts)
             {
                 var part = rawPart.Trim();
@@ -133,7 +146,7 @@ namespace PhonePhotoReturn
                 return null;
             }
 
-            var parts = disposition.Split(';');
+            var parts = SplitHeaderParts(disposition);
             var prefix = name + "=";
             foreach (var rawPart in parts)
             {
@@ -147,15 +160,91 @@ namespace PhonePhotoReturn
                 if (value.Length >= 2 && value[0] == '"' && value[value.Length - 1] == '"')
                 {
                     value = value.Substring(1, value.Length - 2);
+                    value = UnescapeQuotedValue(value);
                 }
                 if (name.EndsWith("*", StringComparison.Ordinal) && value.StartsWith("UTF-8''", StringComparison.OrdinalIgnoreCase))
                 {
                     return Uri.UnescapeDataString(value.Substring("UTF-8''".Length));
                 }
-                return value.Replace("\\\"", "\"");
+                return value;
             }
 
             return null;
+        }
+
+        private static List<string> SplitHeaderParts(string value)
+        {
+            var parts = new List<string>();
+            var start = 0;
+            var inQuotes = false;
+            var escaped = false;
+
+            for (var i = 0; i < value.Length; i++)
+            {
+                var ch = value[i];
+                if (escaped)
+                {
+                    escaped = false;
+                    continue;
+                }
+
+                if (inQuotes && ch == '\\')
+                {
+                    escaped = true;
+                    continue;
+                }
+
+                if (ch == '"')
+                {
+                    inQuotes = !inQuotes;
+                    continue;
+                }
+
+                if (ch == ';' && !inQuotes)
+                {
+                    parts.Add(value.Substring(start, i - start));
+                    start = i + 1;
+                }
+            }
+
+            parts.Add(value.Substring(start));
+            return parts;
+        }
+
+        private static string UnescapeQuotedValue(string value)
+        {
+            if (value.IndexOf('\\') < 0)
+            {
+                return value;
+            }
+
+            var builder = new StringBuilder(value.Length);
+            var escaped = false;
+            for (var i = 0; i < value.Length; i++)
+            {
+                var ch = value[i];
+                if (escaped)
+                {
+                    builder.Append(ch);
+                    escaped = false;
+                    continue;
+                }
+
+                if (ch == '\\')
+                {
+                    escaped = true;
+                    continue;
+                }
+
+                builder.Append(ch);
+            }
+
+            if (escaped)
+            {
+                builder.Append('\\');
+            }
+
+            return builder.ToString();
         }
 
         private static List<int> FindBoundaryIndexes(byte[] haystack, byte[] needle)

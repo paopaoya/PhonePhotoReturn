@@ -14,12 +14,19 @@ namespace PhonePhotoReturn
     internal sealed class PhotoServer : IDisposable
     {
         public const int Port = 36666;
+        private const long MaxRequestBodyBytes = 512L * 1024L * 1024L;
+        private static readonly TimeSpan OutboxItemLifetime = TimeSpan.FromHours(1);
         private static readonly HashSet<string> AllowedExtensions = new HashSet<string>(
             new[] { ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic" },
+            StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> ReservedDeviceNames = new HashSet<string>(
+            new[] { "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9" },
             StringComparer.OrdinalIgnoreCase);
 
         private readonly SynchronizationContext _context;
         private readonly object _syncRoot = new object();
+        private readonly object _outboxLock = new object();
+        private readonly List<OutboxItem> _outbox = new List<OutboxItem>();
         private TcpListener _listener;
         private Thread _listenerThread;
         private bool _disposed;
@@ -27,17 +34,27 @@ namespace PhonePhotoReturn
 
         public event EventHandler<ServerMessageEventArgs> Message;
         public event EventHandler<ServerErrorEventArgs> Error;
+        public event EventHandler<OutboxChangedEventArgs> OutboxChanged;
         public event EventHandler Ready;
 
         public PhotoServer()
         {
             _context = SynchronizationContext.Current;
-            Token = CreateToken();
-            UploadDirectory = SettingsStore.LoadUploadDirectory();
+            var fixedToken = SettingsStore.LoadFixedTokenEnabled() ? SettingsStore.LoadFixedToken() : null;
+            Token = string.IsNullOrEmpty(fixedToken) ? CreateToken() : fixedToken;
+            PhotoUploadDirectory = SettingsStore.LoadUploadDirectory();
+            FileUploadDirectory = SettingsStore.LoadFileUploadDirectory();
         }
 
         public string Token { get; private set; }
-        public string UploadDirectory { get; set; }
+        public string UploadDirectory
+        {
+            get { return PhotoUploadDirectory; }
+            set { PhotoUploadDirectory = value; }
+        }
+
+        public string PhotoUploadDirectory { get; set; }
+        public string FileUploadDirectory { get; set; }
 
         public string Host
         {
@@ -68,6 +85,7 @@ namespace PhonePhotoReturn
                     + "\"base_url\":\"" + JsonEscape("http://" + host + ":" + Port) + "\","
                     + "\"token\":\"" + JsonEscape(Token) + "\","
                     + "\"upload_path\":\"/upload\","
+                    + "\"outbox_path\":\"/outbox.json\","
                     + "\"health_path\":\"/health\""
                     + "}";
             }
@@ -82,7 +100,8 @@ namespace PhonePhotoReturn
                     return;
                 }
 
-                Directory.CreateDirectory(UploadDirectory);
+                Directory.CreateDirectory(PhotoUploadDirectory);
+                Directory.CreateDirectory(FileUploadDirectory);
                 _listener = new TcpListener(IPAddress.Any, Port);
                 try
                 {
@@ -185,9 +204,21 @@ namespace PhonePhotoReturn
 
         private void HandleRequest(Stream stream, HttpRequestData request)
         {
+            if (request.BodyTooLarge)
+            {
+                WriteResponse(stream, 413, "application/json; charset=utf-8", "{\"error\":\"Request entity too large\"}");
+                return;
+            }
+
             if (request.Method == "POST" && request.Path == "/upload")
             {
                 HandleUpload(stream, request);
+                return;
+            }
+
+            if (request.Method == "GET" && request.Path.StartsWith("/download/", StringComparison.OrdinalIgnoreCase))
+            {
+                HandleDownload(stream, request);
                 return;
             }
 
@@ -210,6 +241,7 @@ namespace PhonePhotoReturn
                     + "\"name\":\"" + JsonEscape(MainForm.AppName) + "\","
                     + "\"version\":1,"
                     + "\"upload_path\":\"/upload\","
+                    + "\"outbox_path\":\"/outbox.json\","
                     + "\"server_time\":\"" + JsonEscape(DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss")) + "\""
                     + "}";
                 WriteResponse(stream, 200, "application/json; charset=utf-8", json);
@@ -219,6 +251,20 @@ namespace PhonePhotoReturn
             if (request.Method == "GET" && request.Path == "/pair.json")
             {
                 WriteResponse(stream, 200, "application/json; charset=utf-8", PairPayload);
+                return;
+            }
+
+            if (request.Method == "GET" && request.Path == "/outbox.json")
+            {
+                WriteResponse(stream, 200, "application/json; charset=utf-8", BuildOutboxJson());
+                return;
+            }
+
+            if (request.Method == "POST"
+                && request.Path.StartsWith("/outbox/", StringComparison.OrdinalIgnoreCase)
+                && request.Path.EndsWith("/ack", StringComparison.OrdinalIgnoreCase))
+            {
+                HandleOutboxAck(stream, request);
                 return;
             }
 
@@ -254,36 +300,66 @@ namespace PhonePhotoReturn
                 return;
             }
 
-            if (form.FileBytes == null || form.FileBytes.Length == 0)
+            if (form.FileBytes == null || string.IsNullOrEmpty(form.FieldName))
             {
                 WriteResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"No file part\"}");
                 return;
             }
 
-            var savedPath = SavePhoto(form.FileName, form.FileBytes);
-            RaiseMessage("\u5df2\u4fdd\u5b58\u7167\u7247: " + savedPath);
-            WriteResponse(stream, 200, "application/json; charset=utf-8", "{\"message\":\"Success\",\"filename\":\"" + JsonEscape(Path.GetFileName(savedPath)) + "\"}");
+            if (form.IsPhoto && form.FileBytes.Length == 0)
+            {
+                WriteResponse(stream, 400, "application/json; charset=utf-8", "{\"error\":\"Empty photo\"}");
+                return;
+            }
+
+            string savedPath;
+            string kind;
+            try
+            {
+                savedPath = SaveUpload(form);
+                kind = form.IsFile ? "file" : "photo";
+            }
+            catch (Exception ex)
+            {
+                WriteResponse(stream, 500, "application/json; charset=utf-8", "{\"error\":\"" + JsonEscape(ex.Message) + "\"}");
+                return;
+            }
+
+            var label = form.IsFile ? "\u6587\u4ef6" : "\u7167\u7247";
+            RaiseMessage("\u5df2\u4fdd\u5b58" + label + ": " + savedPath);
+            WriteResponse(stream, 200, "application/json; charset=utf-8", "{\"message\":\"Success\",\"filename\":\"" + JsonEscape(Path.GetFileName(savedPath)) + "\",\"kind\":\"" + kind + "\"}");
         }
 
-        private string SavePhoto(string originalName, byte[] bytes)
+        private string SaveUpload(MultipartFormData form)
         {
-            Directory.CreateDirectory(UploadDirectory);
-            var safeName = BuildSafeFileName(originalName);
+            if (form.IsFile)
+            {
+                return SaveFile(FileUploadDirectory, form.FileName, form.FileBytes, false);
+            }
+
+            return SaveFile(PhotoUploadDirectory, form.FileName, form.FileBytes, true);
+        }
+
+        private string SaveFile(string directory, string originalName, byte[] bytes, bool forcePhotoExtension)
+        {
+            Directory.CreateDirectory(directory);
+            var fallbackName = forcePhotoExtension ? "photo.jpg" : "file.bin";
+            var safeName = BuildSafeFileName(originalName, fallbackName);
             var suffix = Path.GetExtension(safeName);
-            if (string.IsNullOrEmpty(suffix) || !AllowedExtensions.Contains(suffix))
+            if (forcePhotoExtension && (string.IsNullOrEmpty(suffix) || !AllowedExtensions.Contains(suffix)))
             {
                 suffix = ".jpg";
             }
             var stem = Path.GetFileNameWithoutExtension(safeName);
             if (string.IsNullOrWhiteSpace(stem))
             {
-                stem = "photo";
+                stem = forcePhotoExtension ? "photo" : "file";
             }
 
             for (var i = 0; i < 100; i++)
             {
                 var fileName = i == 0 ? stem + suffix : stem + "(" + i + ")" + suffix;
-                var path = Path.Combine(UploadDirectory, fileName);
+                var path = Path.Combine(directory, fileName);
                 try
                 {
                     using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write))
@@ -297,7 +373,251 @@ namespace PhonePhotoReturn
                 }
             }
 
-            throw new IOException("\u65e0\u6cd5\u521b\u5efa\u552f\u4e00\u7167\u7247\u6587\u4ef6\u540d\u3002");
+            throw new IOException("\u65e0\u6cd5\u521b\u5efa\u552f\u4e00\u6587\u4ef6\u540d\u3002");
+        }
+
+        public OutboxItem AddOutboxFile(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            {
+                throw new FileNotFoundException("\u6587\u4ef6\u4e0d\u5b58\u5728\u3002", filePath);
+            }
+
+            var info = new FileInfo(filePath);
+            var item = new OutboxItem();
+            item.Id = CreateToken();
+            item.FilePath = info.FullName;
+            item.FileName = BuildSafeFileName(info.Name, "file.bin");
+            item.Size = info.Length;
+            item.CreatedAt = DateTime.Now;
+            item.ExpiresAt = item.CreatedAt.Add(OutboxItemLifetime);
+            item.Status = OutboxStatus.Pending;
+
+            lock (_outboxLock)
+            {
+                CleanupExpiredOutboxItems(null);
+                _outbox.Add(item);
+            }
+
+            RaiseOutboxChanged(item);
+            RaiseMessage("\u5df2\u52a0\u5165\u5f85\u53d1\u9001\u6587\u4ef6: " + item.FileName);
+            return item;
+        }
+
+        public OutboxItem[] GetOutboxSnapshot()
+        {
+            lock (_outboxLock)
+            {
+                CleanupExpiredOutboxItems(null);
+                return _outbox.Select(CloneOutboxItem).ToArray();
+            }
+        }
+
+        private string BuildOutboxJson()
+        {
+            OutboxItem[] snapshot;
+            var expired = new List<OutboxItem>();
+            lock (_outboxLock)
+            {
+                CleanupExpiredOutboxItems(expired);
+                snapshot = _outbox
+                    .Where(item => item.Status == OutboxStatus.Pending || item.Status == OutboxStatus.Downloading)
+                    .Select(CloneOutboxItem)
+                    .ToArray();
+            }
+            RaiseOutboxChanged(expired);
+
+            var builder = new StringBuilder();
+            builder.Append("{\"items\":[");
+            for (var i = 0; i < snapshot.Length; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(",");
+                }
+
+                var item = snapshot[i];
+                builder.Append("{");
+                builder.Append("\"id\":\"").Append(JsonEscape(item.Id)).Append("\",");
+                builder.Append("\"name\":\"").Append(JsonEscape(item.FileName)).Append("\",");
+                builder.Append("\"size\":").Append(item.Size).Append(",");
+                builder.Append("\"created_at\":\"").Append(JsonEscape(FormatJsonDate(item.CreatedAt))).Append("\",");
+                builder.Append("\"expires_at\":\"").Append(JsonEscape(FormatJsonDate(item.ExpiresAt))).Append("\",");
+                builder.Append("\"download_path\":\"/download/").Append(JsonEscape(Uri.EscapeDataString(item.Id))).Append("\",");
+                builder.Append("\"status\":\"").Append(JsonEscape(StatusToJson(item.Status))).Append("\"");
+                builder.Append("}");
+            }
+            builder.Append("]}");
+            return builder.ToString();
+        }
+
+        private void HandleDownload(Stream stream, HttpRequestData request)
+        {
+            if (!ValidateToken(request))
+            {
+                WriteResponse(stream, 403, "application/json; charset=utf-8", "{\"error\":\"Forbidden\"}");
+                return;
+            }
+
+            var id = Uri.UnescapeDataString(request.Path.Substring("/download/".Length));
+            OutboxItem item;
+            var expired = new List<OutboxItem>();
+            lock (_outboxLock)
+            {
+                CleanupExpiredOutboxItems(expired);
+                item = _outbox.FirstOrDefault(candidate => string.Equals(candidate.Id, id, StringComparison.Ordinal));
+                if (item != null
+                    && (item.Status == OutboxStatus.Pending || item.Status == OutboxStatus.Downloading)
+                    && File.Exists(item.FilePath))
+                {
+                    item.Status = OutboxStatus.Downloading;
+                    item = CloneOutboxItem(item);
+                }
+                else
+                {
+                    item = null;
+                }
+            }
+            RaiseOutboxChanged(expired);
+
+            if (item == null)
+            {
+                WriteResponse(stream, 404, "application/json; charset=utf-8", "{\"error\":\"Not found\"}");
+                return;
+            }
+
+            RaiseOutboxChanged(item);
+            WriteFileResponse(stream, item);
+        }
+
+        private void HandleOutboxAck(Stream stream, HttpRequestData request)
+        {
+            var prefix = "/outbox/";
+            var suffix = "/ack";
+            var id = request.Path.Substring(prefix.Length, request.Path.Length - prefix.Length - suffix.Length);
+            id = Uri.UnescapeDataString(id);
+
+            OutboxItem changed = null;
+            lock (_outboxLock)
+            {
+                var item = _outbox.FirstOrDefault(candidate => string.Equals(candidate.Id, id, StringComparison.Ordinal));
+                if (item != null)
+                {
+                    item.Status = OutboxStatus.Completed;
+                    changed = CloneOutboxItem(item);
+                }
+            }
+
+            if (changed == null)
+            {
+                WriteResponse(stream, 404, "application/json; charset=utf-8", "{\"error\":\"Not found\"}");
+                return;
+            }
+
+            RaiseOutboxChanged(changed);
+            RaiseMessage("\u624b\u673a\u5df2\u4e0b\u8f7d: " + changed.FileName);
+            WriteResponse(stream, 200, "application/json; charset=utf-8", "{\"ok\":true}");
+        }
+
+        private void WriteFileResponse(Stream stream, OutboxItem item)
+        {
+            try
+            {
+                using (var file = new FileStream(item.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    var disposition = "attachment; filename=\"" + HeaderQuotedFileName(item.FileName) + "\"; filename*=UTF-8''" + Uri.EscapeDataString(item.FileName);
+                    var header = "HTTP/1.1 200 OK\r\n"
+                        + "Content-Type: application/octet-stream\r\n"
+                        + "Content-Length: " + file.Length + "\r\n"
+                        + "Content-Disposition: " + disposition + "\r\n"
+                        + "Connection: close\r\n"
+                        + "\r\n";
+                    var headerBytes = Encoding.ASCII.GetBytes(header);
+                    stream.Write(headerBytes, 0, headerBytes.Length);
+
+                    var buffer = new byte[81920];
+                    int read;
+                    while ((read = file.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        stream.Write(buffer, 0, read);
+                    }
+                }
+            }
+            catch (IOException)
+            {
+                WriteResponse(stream, 404, "application/json; charset=utf-8", "{\"error\":\"Not found\"}");
+            }
+        }
+
+        private void CleanupExpiredOutboxItems(List<OutboxItem> expiredItems)
+        {
+            var now = DateTime.Now;
+            foreach (var item in _outbox)
+            {
+                if ((item.Status == OutboxStatus.Pending || item.Status == OutboxStatus.Downloading) && item.ExpiresAt < now)
+                {
+                    item.Status = OutboxStatus.Expired;
+                    if (expiredItems != null)
+                    {
+                        expiredItems.Add(CloneOutboxItem(item));
+                    }
+                }
+            }
+        }
+
+        private void RaiseOutboxChanged(IEnumerable<OutboxItem> items)
+        {
+            if (items == null)
+            {
+                return;
+            }
+
+            foreach (var item in items)
+            {
+                RaiseOutboxChanged(item);
+            }
+        }
+
+        private static OutboxItem CloneOutboxItem(OutboxItem item)
+        {
+            return new OutboxItem
+            {
+                Id = item.Id,
+                FilePath = item.FilePath,
+                FileName = item.FileName,
+                Size = item.Size,
+                CreatedAt = item.CreatedAt,
+                ExpiresAt = item.ExpiresAt,
+                Status = item.Status
+            };
+        }
+
+        private static string FormatJsonDate(DateTime value)
+        {
+            return value.ToString("yyyy-MM-ddTHH:mm:ss");
+        }
+
+        private static string StatusToJson(OutboxStatus status)
+        {
+            switch (status)
+            {
+                case OutboxStatus.Downloading:
+                    return "downloading";
+                case OutboxStatus.Completed:
+                    return "completed";
+                case OutboxStatus.Failed:
+                    return "failed";
+                case OutboxStatus.Expired:
+                    return "expired";
+                default:
+                    return "pending";
+            }
+        }
+
+        private static string HeaderQuotedFileName(string value)
+        {
+            var safe = BuildAsciiFileName(value);
+            return safe.Replace("\\", "\\\\").Replace("\"", "\\\"");
         }
 
         private bool ValidateToken(HttpRequestData request)
@@ -387,9 +707,16 @@ namespace PhonePhotoReturn
             }
 
             request.ContentType = request.Headers.Get("Content-Type");
-            var contentLength = 0;
-            int.TryParse(request.Headers.Get("Content-Length"), out contentLength);
-            request.Body = ReadBody(stream, contentLength);
+            long contentLength = 0;
+            long.TryParse(request.Headers.Get("Content-Length"), out contentLength);
+            if (contentLength > MaxRequestBodyBytes)
+            {
+                request.BodyTooLarge = true;
+                request.Body = new byte[0];
+                return request;
+            }
+
+            request.Body = ReadBody(stream, (int)contentLength);
             return request;
         }
 
@@ -471,6 +798,10 @@ namespace PhonePhotoReturn
                     return "Forbidden";
                 case 404:
                     return "Not Found";
+                case 413:
+                    return "Request Entity Too Large";
+                case 500:
+                    return "Internal Server Error";
                 default:
                     return "OK";
             }
@@ -544,9 +875,14 @@ namespace PhonePhotoReturn
 
         private static string BuildSafeFileName(string fileName)
         {
+            return BuildSafeFileName(fileName, "photo.jpg");
+        }
+
+        private static string BuildSafeFileName(string fileName, string fallbackName)
+        {
             if (string.IsNullOrEmpty(fileName))
             {
-                return "photo.jpg";
+                return fallbackName;
             }
 
             fileName = fileName.Trim().Replace('/', '_').Replace('\\', '_');
@@ -554,7 +890,46 @@ namespace PhonePhotoReturn
             {
                 fileName = fileName.Replace(invalid, '_');
             }
-            return string.IsNullOrWhiteSpace(fileName) ? "photo.jpg" : fileName;
+
+            fileName = fileName.Trim().TrimEnd('.');
+            if (string.IsNullOrWhiteSpace(fileName))
+            {
+                return fallbackName;
+            }
+
+            var stem = Path.GetFileNameWithoutExtension(fileName);
+            if (ReservedDeviceNames.Contains(stem))
+            {
+                fileName = "_" + fileName;
+            }
+
+            return fileName;
+        }
+
+        private static string BuildAsciiFileName(string fileName)
+        {
+            fileName = BuildSafeFileName(fileName, "file.bin");
+            var builder = new StringBuilder();
+            foreach (var ch in fileName)
+            {
+                if ((ch >= 'a' && ch <= 'z')
+                    || (ch >= 'A' && ch <= 'Z')
+                    || (ch >= '0' && ch <= '9')
+                    || ch == '.'
+                    || ch == '_'
+                    || ch == '-'
+                    || ch == ' ')
+                {
+                    builder.Append(ch);
+                }
+                else
+                {
+                    builder.Append('_');
+                }
+            }
+
+            var result = builder.ToString().Trim();
+            return string.IsNullOrWhiteSpace(result) ? "file.bin" : result;
         }
 
         private static string JsonEscape(string value)
@@ -636,6 +1011,18 @@ namespace PhonePhotoReturn
             });
         }
 
+        private void RaiseOutboxChanged(OutboxItem item)
+        {
+            Post(delegate
+            {
+                var handler = OutboxChanged;
+                if (handler != null)
+                {
+                    handler(this, new OutboxChangedEventArgs(CloneOutboxItem(item)));
+                }
+            });
+        }
+
         private void Post(SendOrPostCallback callback)
         {
             if (_context != null)
@@ -656,7 +1043,38 @@ namespace PhonePhotoReturn
             public WebHeaderCollection Headers;
             public string ContentType;
             public byte[] Body;
+            public bool BodyTooLarge;
         }
+    }
+
+    internal enum OutboxStatus
+    {
+        Pending,
+        Downloading,
+        Completed,
+        Failed,
+        Expired
+    }
+
+    internal sealed class OutboxItem
+    {
+        public string Id;
+        public string FilePath;
+        public string FileName;
+        public long Size;
+        public DateTime CreatedAt;
+        public DateTime ExpiresAt;
+        public OutboxStatus Status;
+    }
+
+    internal sealed class OutboxChangedEventArgs : EventArgs
+    {
+        public OutboxChangedEventArgs(OutboxItem item)
+        {
+            Item = item;
+        }
+
+        public OutboxItem Item { get; private set; }
     }
 
     internal sealed class ServerMessageEventArgs : EventArgs

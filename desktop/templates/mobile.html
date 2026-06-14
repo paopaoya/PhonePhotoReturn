@@ -80,6 +80,8 @@
       <input id="camera" name="photo" type="file" accept="image/*" capture="environment">
       <label class="secondary" for="gallery">从相册选择</label>
       <input id="gallery" name="photo" type="file" accept="image/*" multiple>
+      <label class="secondary" for="files">上传文件</label>
+      <input id="files" name="file" type="file" multiple>
     </div>
     <p id="status">准备就绪</p>
     <img id="preview" alt="照片预览">
@@ -89,6 +91,7 @@
     const token = "{{ token }}";
     const camera = document.getElementById("camera");
     const gallery = document.getElementById("gallery");
+    const files = document.getElementById("files");
     const status = document.getElementById("status");
     const preview = document.getElementById("preview");
     let uploading = false;
@@ -96,18 +99,25 @@
     camera.addEventListener("change", async () => {
       const file = camera.files[0];
       if (!file) return;
-      await uploadFiles([renameFile(file, currentPhotoFileName())]);
+      await uploadFiles([renameFile(file, currentPhotoFileName())], "photo", true, "张");
     });
 
     gallery.addEventListener("change", async () => {
       const files = Array.from(gallery.files || []);
       if (!files.length) return;
-      await uploadFiles(files);
+      await uploadFiles(files, "photo", true, "张");
+    });
+
+    files.addEventListener("change", async () => {
+      const selected = Array.from(files.files || []);
+      if (!selected.length) return;
+      await uploadFiles(selected, "file", false, "个");
     });
 
     function setInputsDisabled(disabled) {
       camera.disabled = disabled;
       gallery.disabled = disabled;
+      files.disabled = disabled;
     }
 
     function currentPhotoFileName() {
@@ -133,7 +143,7 @@
       }
     }
 
-    async function uploadFiles(orderedFiles) {
+    async function uploadFiles(orderedFiles, fieldName, showPreview, unit) {
       if (uploading) return;
       uploading = true;
       setInputsDisabled(true);
@@ -141,26 +151,32 @@
       try {
         for (let i = 0; i < orderedFiles.length; i++) {
           const file = orderedFiles[i];
-          preview.src = URL.createObjectURL(file);
-          preview.style.display = "block";
+          if (showPreview) {
+            preview.src = URL.createObjectURL(file);
+            preview.style.display = "block";
+          } else {
+            preview.removeAttribute("src");
+            preview.style.display = "none";
+          }
           status.textContent = `正在上传 ${i + 1} / ${orderedFiles.length}: ${file.name}`;
-          await uploadOne(file);
+          await uploadOne(file, fieldName);
         }
-        status.textContent = `上传完成：${orderedFiles.length} 张`;
+        status.textContent = `上传完成：${orderedFiles.length} ${unit}`;
       } catch (error) {
         status.textContent = `上传失败：${error.message}`;
       } finally {
         uploading = false;
         gallery.value = "";
         camera.value = "";
+        files.value = "";
         setInputsDisabled(false);
       }
     }
 
-    async function uploadOne(file) {
+    async function uploadOne(file, fieldName) {
       const form = new FormData();
       form.append("token", token);
-      form.append("photo", file, file.uploadName || file.name);
+      form.append(fieldName, file, file.uploadName || file.name || "file.bin");
 
       const response = await fetch(`/upload?token=${encodeURIComponent(token)}`, {
         method: "POST",

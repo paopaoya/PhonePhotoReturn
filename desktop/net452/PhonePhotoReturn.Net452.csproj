@@ -52,6 +52,9 @@
   <ItemGroup>
     <None Include="packages.config" />
     <None Include="..\assets\icon.ico" />
+    <EmbeddedResource Include="..\templates\mobile.html">
+      <LogicalName>mobile.html</LogicalName>
+    </EmbeddedResource>
     <EmbeddedResource Include="packages\ZXing.Net.0.16.11\lib\net45\zxing.dll">
       <LogicalName>zxing.dll</LogicalName>
     </EmbeddedResource>

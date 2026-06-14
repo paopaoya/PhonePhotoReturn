@@ -2,13 +2,20 @@ package com.codex.phonereturn;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.ContentValues;
 import android.content.ClipData;
 import android.database.Cursor;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.DocumentsContract;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.OrientationEventListener;
@@ -41,7 +48,9 @@ import com.google.zxing.Result;
 import com.google.zxing.common.HybridBinarizer;
 
 import org.json.JSONObject;
+import org.json.JSONArray;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -56,9 +65,11 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -67,15 +78,22 @@ import com.google.common.util.concurrent.ListenableFuture;
 public class MainActivity extends Activity implements LifecycleOwner {
     private static final int REQUEST_CAMERA = 1001;
     private static final int REQUEST_PICK_GALLERY = 1002;
+    private static final int REQUEST_PICK_FILES = 1003;
+    private static final int REQUEST_WRITE_STORAGE = 1004;
     private static final String PREFS = "phone_photo_return";
     private static final String KEY_BASE_URL = "base_url";
     private static final String KEY_TOKEN = "token";
     private static final String KEY_HOST = "host";
     private static final String KEY_PORT = "port";
     private static final int DEFAULT_PORT = 36666;
+    private static final long OUTBOX_POLL_INTERVAL_MS = 4000L;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Set<String> handledOutboxIds = new HashSet<>();
+    private final Set<String> downloadingOutboxIds = new HashSet<>();
+    private final Set<String> pendingAckOutboxIds = new HashSet<>();
     private LifecycleRegistry lifecycleRegistry;
     private ProcessCameraProvider cameraProvider;
     private PreviewView previewView;
@@ -94,6 +112,9 @@ public class MainActivity extends Activity implements LifecycleOwner {
     private String host;
     private int port;
     private boolean galleryUploading;
+    private boolean outboxPollScheduled;
+    private boolean outboxChecking;
+    private boolean outboxDownloadActive;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -116,6 +137,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
     protected void onResume() {
         super.onResume();
         lifecycleRegistry.setCurrentState(Lifecycle.State.RESUMED);
+        scheduleOutboxPollNow();
     }
 
     @Override
@@ -127,6 +149,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
     @Override
     protected void onStop() {
         lifecycleRegistry.setCurrentState(Lifecycle.State.CREATED);
+        cancelOutboxPolling();
         super.onStop();
     }
 
@@ -145,6 +168,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         if (orientationListener != null) {
             orientationListener.disable();
         }
+        cancelOutboxPolling();
         lifecycleRegistry.setCurrentState(Lifecycle.State.DESTROYED);
         super.onDestroy();
     }
@@ -163,8 +187,10 @@ public class MainActivity extends Activity implements LifecycleOwner {
             } else if ("camera".equals(pendingCameraAction)) {
                 showCamera();
             }
+        } else if (requestCode == REQUEST_WRITE_STORAGE && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            scheduleOutboxPollNow();
         } else {
-            toast("需要相机权限");
+            toast("需要权限才能继续");
         }
         pendingCameraAction = null;
     }
@@ -175,6 +201,12 @@ public class MainActivity extends Activity implements LifecycleOwner {
         if (requestCode == REQUEST_PICK_GALLERY) {
             if (resultCode == RESULT_OK && data != null) {
                 handleGalleryResult(data);
+            } else {
+                showHome();
+            }
+        } else if (requestCode == REQUEST_PICK_FILES) {
+            if (resultCode == RESULT_OK && data != null) {
+                handleFilePickerResult(data);
             } else {
                 showHome();
             }
@@ -275,6 +307,11 @@ public class MainActivity extends Activity implements LifecycleOwner {
         galleryButton.setOnClickListener(v -> openGalleryPicker());
         root.addView(galleryButton, buttonParams());
 
+        Button fileButton = button("上传文件");
+        fileButton.setEnabled(hasPairing());
+        fileButton.setOnClickListener(v -> openFilePicker());
+        root.addView(fileButton, buttonParams());
+
         Button clearButton = button("清除配对");
         clearButton.setOnClickListener(v -> {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit().clear().apply();
@@ -282,6 +319,9 @@ public class MainActivity extends Activity implements LifecycleOwner {
             token = null;
             host = null;
             port = 0;
+            handledOutboxIds.clear();
+            downloadingOutboxIds.clear();
+            pendingAckOutboxIds.clear();
             showHome();
         });
         root.addView(clearButton, buttonParams());
@@ -292,6 +332,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         root.addView(statusText, fullWrap());
 
         setContentView(root);
+        scheduleOutboxPollNow();
     }
 
     private void showManualPair() {
@@ -410,16 +451,38 @@ public class MainActivity extends Activity implements LifecycleOwner {
         startActivityForResult(intent, REQUEST_PICK_GALLERY);
     }
 
+    private void openFilePicker() {
+        if (!hasPairing()) {
+            toast("请先扫码配对");
+            showHome();
+            return;
+        }
+        if (galleryUploading) {
+            setStatus("正在上传，请稍等...");
+            return;
+        }
+        stopCamera();
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, MediaStore.Downloads.EXTERNAL_CONTENT_URI);
+        }
+        startActivityForResult(intent, REQUEST_PICK_FILES);
+    }
+
     private void handleGalleryResult(Intent data) {
         ArrayList<GalleryItem> selectedItems = new ArrayList<>();
 
         ClipData clipData = data.getClipData();
         if (clipData != null) {
             for (int i = 0; i < clipData.getItemCount(); i++) {
-                addGalleryItem(selectedItems, clipData.getItemAt(i).getUri());
+                addUploadItem(selectedItems, clipData.getItemAt(i).getUri(), "gallery_" + System.currentTimeMillis() + ".jpg");
             }
         } else if (data.getData() != null) {
-            addGalleryItem(selectedItems, data.getData());
+            addUploadItem(selectedItems, data.getData(), "gallery_" + System.currentTimeMillis() + ".jpg");
         }
 
         if (selectedItems.isEmpty()) {
@@ -432,7 +495,29 @@ public class MainActivity extends Activity implements LifecycleOwner {
         uploadGalleryQueue(selectedItems);
     }
 
-    private void addGalleryItem(List<GalleryItem> selectedItems, Uri uri) {
+    private void handleFilePickerResult(Intent data) {
+        ArrayList<GalleryItem> selectedItems = new ArrayList<>();
+
+        ClipData clipData = data.getClipData();
+        if (clipData != null) {
+            for (int i = 0; i < clipData.getItemCount(); i++) {
+                addUploadItem(selectedItems, clipData.getItemAt(i).getUri(), "file.bin");
+            }
+        } else if (data.getData() != null) {
+            addUploadItem(selectedItems, data.getData(), "file.bin");
+        }
+
+        if (selectedItems.isEmpty()) {
+            toast("未选择文件");
+            showHome();
+            return;
+        }
+
+        showHome();
+        uploadFileQueue(selectedItems);
+    }
+
+    private void addUploadItem(List<GalleryItem> selectedItems, Uri uri, String fallbackName) {
         if (uri == null) {
             return;
         }
@@ -442,7 +527,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         } catch (Exception ignored) {
         }
 
-        selectedItems.add(new GalleryItem(uri, displayNameForUri(uri)));
+        selectedItems.add(new GalleryItem(uri, displayNameForUri(uri, fallbackName)));
     }
 
     private void uploadGalleryQueue(List<GalleryItem> ordered) {
@@ -453,10 +538,21 @@ public class MainActivity extends Activity implements LifecycleOwner {
 
         galleryUploading = true;
         setStatus("\u51c6\u5907\u4e0a\u4f20 " + ordered.size() + " \u5f20...");
-        worker.execute(() -> uploadGalleryItems(ordered));
+        worker.execute(() -> uploadItems(ordered, "photo", "张"));
     }
 
-    private void uploadGalleryItems(List<GalleryItem> ordered) {
+    private void uploadFileQueue(List<GalleryItem> ordered) {
+        if (galleryUploading) {
+            setStatus("正在上传，请稍等...");
+            return;
+        }
+
+        galleryUploading = true;
+        setStatus("准备上传 " + ordered.size() + " 个文件...");
+        worker.execute(() -> uploadItems(ordered, "file", "个文件"));
+    }
+
+    private void uploadItems(List<GalleryItem> ordered, String fieldName, String unit) {
         int success = 0;
         for (int i = 0; i < ordered.size(); i++) {
             GalleryItem item = ordered.get(i);
@@ -464,14 +560,14 @@ public class MainActivity extends Activity implements LifecycleOwner {
             int total = ordered.size();
             runOnUiThread(() -> setStatus("\u6b63\u5728\u4e0a\u4f20 " + current + " / " + total + ": " + item.name));
             try {
-                int code = uploadSource(new UriUploadSource(item.uri, item.name));
+                int code = uploadSource(new UriUploadSource(item.uri, item.name), fieldName);
                 if (code >= 200 && code < 300) {
                     success++;
                 } else {
                     int failedAt = current;
                     runOnUiThread(() -> {
                         galleryUploading = false;
-                        setStatus("\u7b2c " + failedAt + " \u5f20\u4e0a\u4f20\u5931\u8d25: HTTP " + code);
+                        setStatus("第 " + failedAt + " " + unit + "上传失败: HTTP " + code);
                     });
                     return;
                 }
@@ -479,7 +575,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
                 int failedAt = current;
                 runOnUiThread(() -> {
                     galleryUploading = false;
-                    setStatus("\u7b2c " + failedAt + " \u5f20\u4e0a\u4f20\u5931\u8d25: " + e.getMessage());
+                    setStatus("第 " + failedAt + " " + unit + "上传失败: " + e.getMessage());
                 });
                 return;
             }
@@ -488,7 +584,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         int uploaded = success;
         runOnUiThread(() -> {
             galleryUploading = false;
-            setStatus("\u4e0a\u4f20\u5b8c\u6210: " + uploaded + " \u5f20");
+            setStatus("上传完成: " + uploaded + " " + unit);
         });
     }
 
@@ -697,7 +793,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         });
     }
 
-    private int uploadSource(UploadSource source) throws IOException {
+    private int uploadSource(UploadSource source, String fieldName) throws IOException {
         String boundary = "----PhonePhotoReturn" + System.currentTimeMillis();
         HttpURLConnection conn = null;
         try {
@@ -712,8 +808,8 @@ public class MainActivity extends Activity implements LifecycleOwner {
 
             OutputStream out = conn.getOutputStream();
             writeAscii(out, "--" + boundary + "\r\n");
-            writeAscii(out, "Content-Disposition: form-data; name=\"photo\"; filename=\"" + fallbackUploadFileName(source.fileName()) + "\"; filename*=UTF-8''" + encodeHeaderFileName(source.fileName()) + "\r\n");
-            writeAscii(out, "Content-Type: image/jpeg\r\n\r\n");
+            writeAscii(out, "Content-Disposition: form-data; name=\"" + fieldName + "\"; filename=\"" + fallbackUploadFileName(source.fileName()) + "\"; filename*=UTF-8''" + encodeHeaderFileName(source.fileName()) + "\r\n");
+            writeAscii(out, "Content-Type: " + ("photo".equals(fieldName) ? "image/jpeg" : "application/octet-stream") + "\r\n\r\n");
             InputStream in = source.open();
             try {
                 byte[] buffer = new byte[8192];
@@ -761,6 +857,379 @@ public class MainActivity extends Activity implements LifecycleOwner {
                 }
             }
         });
+    }
+
+    private void scheduleOutboxPollNow() {
+        if (!hasPairing() || lifecycleRegistry == null || lifecycleRegistry.getCurrentState() == Lifecycle.State.DESTROYED) {
+            return;
+        }
+        if (outboxPollScheduled) {
+            return;
+        }
+        outboxPollScheduled = true;
+        mainHandler.post(outboxPollRunnable);
+    }
+
+    private void scheduleNextOutboxPoll() {
+        if (!hasPairing() || lifecycleRegistry == null || !lifecycleRegistry.getCurrentState().isAtLeast(Lifecycle.State.STARTED)) {
+            outboxPollScheduled = false;
+            return;
+        }
+        outboxPollScheduled = true;
+        mainHandler.postDelayed(outboxPollRunnable, OUTBOX_POLL_INTERVAL_MS);
+    }
+
+    private void cancelOutboxPolling() {
+        outboxPollScheduled = false;
+        mainHandler.removeCallbacks(outboxPollRunnable);
+    }
+
+    private final Runnable outboxPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            outboxPollScheduled = false;
+            checkOutboxOnce();
+        }
+    };
+
+    private void checkOutboxOnce() {
+        if (!hasPairing() || outboxChecking || outboxDownloadActive) {
+            scheduleNextOutboxPoll();
+            return;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_WRITE_STORAGE);
+            return;
+        }
+
+        outboxChecking = true;
+        worker.execute(() -> {
+            try {
+                retryPendingOutboxAcks();
+                List<OutboxItem> items = fetchOutboxItems();
+                for (OutboxItem item : items) {
+                    if (handledOutboxIds.contains(item.id) || downloadingOutboxIds.contains(item.id)) {
+                        continue;
+                    }
+                    if (!"pending".equals(item.status) && !"downloading".equals(item.status)) {
+                        continue;
+                    }
+                    downloadOutboxItem(item);
+                    break;
+                }
+            } catch (Exception e) {
+                runOnUiThread(() -> setStatus("接收电脑文件失败: " + e.getMessage()));
+            } finally {
+                outboxChecking = false;
+                runOnUiThread(this::scheduleNextOutboxPoll);
+            }
+        });
+    }
+
+    private List<OutboxItem> fetchOutboxItems() throws Exception {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(baseUrl + "/outbox.json");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                throw new IOException("HTTP " + code);
+            }
+
+            String body = readText(conn.getInputStream());
+            JSONObject json = new JSONObject(body);
+            JSONArray array = json.optJSONArray("items");
+            ArrayList<OutboxItem> items = new ArrayList<>();
+            if (array == null) {
+                return items;
+            }
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject itemJson = array.optJSONObject(i);
+                if (itemJson == null) {
+                    continue;
+                }
+                OutboxItem item = new OutboxItem();
+                item.id = itemJson.optString("id");
+                item.name = itemJson.optString("name", "file.bin");
+                item.downloadPath = itemJson.optString("download_path");
+                item.status = itemJson.optString("status", "pending");
+                if (!item.id.isEmpty() && !item.downloadPath.isEmpty()) {
+                    items.add(item);
+                }
+            }
+            return items;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private void downloadOutboxItem(OutboxItem item) {
+        downloadingOutboxIds.add(item.id);
+        outboxDownloadActive = true;
+        runOnUiThread(() -> setStatus("正在接收电脑文件: " + item.name));
+
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(baseUrl + item.downloadPath);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(30000);
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                throw new IOException("HTTP " + code);
+            }
+
+            String fileName = fileNameFromDisposition(conn.getHeaderField("Content-Disposition"), item.name);
+            saveDownload(fileName, conn.getInputStream());
+            handledOutboxIds.add(item.id);
+            try {
+                acknowledgeOutboxItem(item.id);
+                pendingAckOutboxIds.remove(item.id);
+                runOnUiThread(() -> setStatus("已保存到 Download/PhonePhotoReturn: " + item.name));
+            } catch (Exception ackError) {
+                pendingAckOutboxIds.add(item.id);
+                runOnUiThread(() -> setStatus("已保存到 Download/PhonePhotoReturn，回执失败: " + item.name));
+            }
+        } catch (Exception e) {
+            runOnUiThread(() -> setStatus("接收电脑文件失败: " + e.getMessage()));
+        } finally {
+            downloadingOutboxIds.remove(item.id);
+            outboxDownloadActive = false;
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private void retryPendingOutboxAcks() {
+        if (pendingAckOutboxIds.isEmpty()) {
+            return;
+        }
+
+        ArrayList<String> pendingIds = new ArrayList<>(pendingAckOutboxIds);
+        for (String id : pendingIds) {
+            try {
+                acknowledgeOutboxItem(id);
+                pendingAckOutboxIds.remove(id);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void acknowledgeOutboxItem(String id) throws IOException {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(baseUrl + "/outbox/" + encodePathSegment(id) + "/ack");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Content-Length", "0");
+            conn.getOutputStream().close();
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                throw new IOException("ack HTTP " + code);
+            }
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private void saveDownload(String fileName, InputStream input) throws IOException {
+        String safeName = sanitizeFileName(fileName);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            saveDownloadWithMediaStore(safeName, input);
+        } else {
+            saveDownloadLegacy(safeName, input);
+        }
+    }
+
+    private void saveDownloadWithMediaStore(String fileName, InputStream input) throws IOException {
+        String relativePath = Environment.DIRECTORY_DOWNLOADS + "/PhonePhotoReturn";
+        String uniqueName = uniqueMediaStoreFileName(relativePath, fileName);
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, uniqueName);
+        values.put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream");
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath);
+        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+        Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) {
+            throw new IOException("Cannot create download file.");
+        }
+
+        try {
+            OutputStream output = getContentResolver().openOutputStream(uri);
+            if (output == null) {
+                throw new IOException("Cannot open download file.");
+            }
+            try {
+                copyStream(input, output);
+            } finally {
+                output.close();
+            }
+            ContentValues done = new ContentValues();
+            done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+            getContentResolver().update(uri, done, null, null);
+        } catch (IOException e) {
+            getContentResolver().delete(uri, null, null);
+            throw e;
+        } finally {
+            input.close();
+        }
+    }
+
+    private void saveDownloadLegacy(String fileName, InputStream input) throws IOException {
+        File directory = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "PhonePhotoReturn");
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw new IOException("Cannot create download directory.");
+        }
+
+        File outputFile = uniqueFile(directory, fileName);
+        OutputStream output = new java.io.FileOutputStream(outputFile);
+        try {
+            copyStream(input, output);
+        } finally {
+            output.close();
+            input.close();
+        }
+    }
+
+    private String uniqueMediaStoreFileName(String relativePath, String fileName) {
+        String stem = nameStem(fileName);
+        String suffix = nameSuffix(fileName);
+        for (int i = 0; i < 100; i++) {
+            String candidate = i == 0 ? stem + suffix : stem + "(" + i + ")" + suffix;
+            if (!mediaStoreFileExists(relativePath, candidate)) {
+                return candidate;
+            }
+        }
+        return stem + "_" + System.currentTimeMillis() + suffix;
+    }
+
+    private boolean mediaStoreFileExists(String relativePath, String fileName) {
+        Cursor cursor = null;
+        try {
+            String selection = MediaStore.MediaColumns.RELATIVE_PATH + "=? AND " + MediaStore.MediaColumns.DISPLAY_NAME + "=?";
+            String[] args = new String[]{relativePath + "/", fileName};
+            cursor = getContentResolver().query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    new String[]{MediaStore.MediaColumns._ID}, selection, args, null);
+            return cursor != null && cursor.moveToFirst();
+        } catch (Exception ignored) {
+            return false;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+    }
+
+    private File uniqueFile(File directory, String fileName) {
+        String stem = nameStem(fileName);
+        String suffix = nameSuffix(fileName);
+        for (int i = 0; i < 100; i++) {
+            File candidate = new File(directory, i == 0 ? stem + suffix : stem + "(" + i + ")" + suffix);
+            if (!candidate.exists()) {
+                return candidate;
+            }
+        }
+        return new File(directory, stem + "_" + System.currentTimeMillis() + suffix);
+    }
+
+    private void copyStream(InputStream input, OutputStream output) throws IOException {
+        byte[] buffer = new byte[8192];
+        int read;
+        while ((read = input.read(buffer)) != -1) {
+            output.write(buffer, 0, read);
+        }
+    }
+
+    private String readText(InputStream input) throws IOException {
+        try {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            copyStream(input, output);
+            return output.toString(StandardCharsets.UTF_8.name());
+        } finally {
+            input.close();
+        }
+    }
+
+    private String fileNameFromDisposition(String disposition, String fallback) {
+        String plainFileName = null;
+        if (disposition != null) {
+            String[] parts = disposition.split(";");
+            for (String rawPart : parts) {
+                String part = rawPart.trim();
+                if (part.toLowerCase(Locale.US).startsWith("filename*=")) {
+                    String value = part.substring("filename*=".length()).trim();
+                    if (value.toUpperCase(Locale.US).startsWith("UTF-8''")) {
+                        value = value.substring("UTF-8''".length());
+                    }
+                    try {
+                        return java.net.URLDecoder.decode(value, StandardCharsets.UTF_8.name());
+                    } catch (Exception ignored) {
+                    }
+                } else if (part.toLowerCase(Locale.US).startsWith("filename=")) {
+                    String value = part.substring("filename=".length()).trim();
+                    if (value.startsWith("\"") && value.endsWith("\"") && value.length() >= 2) {
+                        value = value.substring(1, value.length() - 1);
+                    }
+                    plainFileName = value;
+                }
+            }
+        }
+        if (plainFileName != null && !plainFileName.trim().isEmpty()) {
+            return plainFileName;
+        }
+        return fallback == null || fallback.trim().isEmpty() ? "file.bin" : fallback;
+    }
+
+    private String sanitizeFileName(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            return "file.bin";
+        }
+        String clean = name.trim().replace('/', '_').replace('\\', '_');
+        while (clean.endsWith(".")) {
+            clean = clean.substring(0, clean.length() - 1);
+        }
+        return clean.trim().isEmpty() ? "file.bin" : clean;
+    }
+
+    private String nameStem(String fileName) {
+        int dot = fileName.lastIndexOf('.');
+        if (dot <= 0) {
+            return fileName;
+        }
+        return fileName.substring(0, dot);
+    }
+
+    private String nameSuffix(String fileName) {
+        int dot = fileName.lastIndexOf('.');
+        if (dot <= 0 || dot == fileName.length() - 1) {
+            return "";
+        }
+        return fileName.substring(dot);
+    }
+
+    private String encodePathSegment(String value) {
+        try {
+            return URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20");
+        } catch (Exception e) {
+            return value;
+        }
     }
 
     private void ensureCameraPermission(String action) {
@@ -895,7 +1364,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
         out.write(value.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
     }
 
-    private String displayNameForUri(Uri uri) {
+    private String displayNameForUri(Uri uri, String fallbackName) {
         Cursor cursor = null;
         try {
             cursor = getContentResolver().query(uri, null, null, null, null);
@@ -914,7 +1383,7 @@ public class MainActivity extends Activity implements LifecycleOwner {
                 cursor.close();
             }
         }
-        return "gallery_" + System.currentTimeMillis() + ".jpg";
+        return fallbackName;
     }
 
     private String fallbackUploadFileName(String name) {
@@ -1042,6 +1511,13 @@ public class MainActivity extends Activity implements LifecycleOwner {
             this.uri = uri;
             this.name = name;
         }
+    }
+
+    private static class OutboxItem {
+        String id;
+        String name;
+        String downloadPath;
+        String status;
     }
 
     private static class Pairing {
